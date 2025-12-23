@@ -49,6 +49,32 @@ run_training() {
     local model_type=$1
     local epochs=$2
     local log_file="logs/${model_type}_${epochs}epochs.log"
+    local metrics_file="${SAVE_DIR}/${model_type}_wikitext2_${epochs}epochs_metrics.json"
+    
+    # Check if this run already completed
+    if [ -f "$metrics_file" ]; then
+        echo "----------------------------------------"
+        echo "Skipping: ${model_type^^} with ${epochs} epochs (already completed)"
+        echo "Metrics file exists: $metrics_file"
+        echo "----------------------------------------"
+        echo ""
+        return 0
+    fi
+    
+    # Check if we can resume from checkpoint
+    local checkpoint_pattern="${SAVE_DIR}/checkpoint_epoch_*.pt"
+    local checkpoints=($(ls $checkpoint_pattern 2>/dev/null | sort -V))
+    if [ ${#checkpoints[@]} -gt 0 ]; then
+        local latest_checkpoint=${checkpoints[-1]}
+        local checkpoint_epoch=$(echo "$latest_checkpoint" | grep -oP 'checkpoint_epoch_\K\d+' | head -1)
+        if [ ! -z "$checkpoint_epoch" ] && [ "$checkpoint_epoch" -lt "$epochs" ]; then
+            echo "----------------------------------------"
+            echo "Resuming: ${model_type^^} with ${epochs} epochs"
+            echo "Found checkpoint at epoch $checkpoint_epoch, will resume from there"
+            echo "Checkpoint: $latest_checkpoint"
+            echo "----------------------------------------"
+        fi
+    fi
     
     echo "----------------------------------------"
     echo "Starting: ${model_type^^} with ${epochs} epochs"
@@ -141,7 +167,7 @@ PLOT_OUTPUT_DIR="$SAVE_DIR/plots"
 
 if python visualize_training.py "$SAVE_DIR" --output_dir "$PLOT_OUTPUT_DIR" --compare_epochs; then
     echo ""
-    echo "✓ Combined comparison plots generated successfully!"
+    echo "Combined comparison plots generated successfully!"
     echo ""
     echo "Generated plots:"
     echo "  - mdlm_epoch_comparison.png (MDLM across all epoch counts)"

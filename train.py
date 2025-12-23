@@ -703,10 +703,68 @@ def main_worker(rank, world_size, args):
     
     # Initialize metrics logger (only on rank 0)
     metrics_logger = None
+    start_epoch = 0
     if rank == 0:
         model_type_str = model_type.upper()
         experiment_name = args.experiment_name or f"{model_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         metrics_logger = MetricsLogger(args.save_dir, model_type=model_type_str, experiment_name=experiment_name)
+        
+        # Check for existing checkpoints to resume from (for this specific experiment)
+        checkpoint_dir = args.save_dir
+        if os.path.exists(checkpoint_dir):
+            checkpoint_files = [f for f in os.listdir(checkpoint_dir) if f.startswith('checkpoint_epoch_') and f.endswith('.pt')]
+            if checkpoint_files:
+                # Extract epoch numbers and find the latest
+                epoch_numbers = []
+                for f in checkpoint_files:
+                    try:
+                        epoch_num = int(f.replace('checkpoint_epoch_', '').replace('.pt', ''))
+                        # Only consider checkpoints that are less than target epochs
+                        if epoch_num < args.epochs:
+                            epoch_numbers.append(epoch_num)
+                    except ValueError:
+                        continue
+                
+                if epoch_numbers:
+                    latest_epoch = max(epoch_numbers)
+                    checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{latest_epoch}.pt')
+                    
+                    if os.path.exists(checkpoint_path):
+                        print(f"\n{'='*60}")
+                        print(f"Found checkpoint: {checkpoint_path}")
+                        print(f"Resuming from epoch {latest_epoch + 1}/{args.epochs}")
+                        print(f"{'='*60}\n")
+                        
+                        # Load checkpoint
+                        checkpoint = torch.load(checkpoint_path, map_location=device)
+                        start_epoch = checkpoint['epoch'] + 1  # Start from next epoch
+                        
+                        # Load model state
+                        if isinstance(model, DDP):
+                            model.module.load_state_dict(checkpoint['model_state_dict'])
+                        else:
+                            model.load_state_dict(checkpoint['model_state_dict'])
+                        
+                        # Load optimizer state
+                        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                        
+                        # Load metrics if available
+                        metrics_file = os.path.join(checkpoint_dir, f'{experiment_name}_metrics.json')
+                        if os.path.exists(metrics_file):
+                            with open(metrics_file, 'r') as f:
+                                saved_metrics = json.load(f)
+                                metrics_logger.metrics = saved_metrics
+                                metrics_logger.current_epoch = start_epoch - 1
+                                metrics_logger.global_step = len(saved_metrics.get('steps', []))
+                                print(f"Loaded metrics from: {metrics_file}")
+                        
+                        print(f"Resuming training from epoch {start_epoch + 1}/{args.epochs}\n")
+    
+    # Broadcast start_epoch to all ranks
+    if world_size > 1:
+        start_epoch_tensor = torch.tensor([start_epoch], dtype=torch.long, device=device)
+        dist.broadcast(start_epoch_tensor, src=0)
+        start_epoch = int(start_epoch_tensor.item())
     
     # Training loop
     if rank == 0:
@@ -715,8 +773,10 @@ def main_worker(rank, world_size, args):
             print(f"Using {world_size} GPUs with distributed training")
         if metrics_logger:
             print(f"Metrics will be saved to: {metrics_logger.save_dir}")
+        if start_epoch > 0:
+            print(f"Resuming from epoch {start_epoch + 1}/{args.epochs}")
     
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         # Update epoch for HuggingFace dataloader (for shard shuffling)
         if use_hf_data:
             dataloader = get_dataloader(
