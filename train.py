@@ -124,13 +124,13 @@ def setup_distributed(rank, world_size, backend='nccl', master_port=None):
     else:
         target_port = '25419'  # Default
     
-    # Set the port 
+    # Set the port
     os.environ['MASTER_PORT'] = target_port
     
     # Double-check it's set correctly (sometimes torchrun overrides it)
     if os.environ.get('MASTER_PORT') != target_port:
         print(f"[WARNING] MASTER_PORT was overridden! Expected {target_port}, got {os.environ.get('MASTER_PORT')}")
-        os.environ['MASTER_PORT'] = target_port
+    os.environ['MASTER_PORT'] = target_port
     
     # Debug: Print which port we're using (only on rank 0)
     if rank == 0:
@@ -488,17 +488,17 @@ def main_worker(rank, world_size, args):
         ).to(device)
     else:  # mdlm
         model = MDLModel(
-            vocab_size=args.vocab_size,
-            d_model=args.d_model,
-            n_layers=args.n_layers,
-            n_heads=args.n_heads,
-            d_ff=args.d_ff,
-            max_seq_len=args.max_seq_len,
-            dropout=args.dropout,
-            use_rope=args.use_rope,
-            rope_theta=args.rope_theta,
-            rope_percent=args.rope_percent
-        ).to(device)
+        vocab_size=args.vocab_size,
+        d_model=args.d_model,
+        n_layers=args.n_layers,
+        n_heads=args.n_heads,
+        d_ff=args.d_ff,
+        max_seq_len=args.max_seq_len,
+        dropout=args.dropout,
+        use_rope=args.use_rope,
+        rope_theta=args.rope_theta,
+        rope_percent=args.rope_percent
+    ).to(device)
     
     # Wrap with DDP if distributed
     if world_size > 1:
@@ -821,21 +821,32 @@ def main_worker(rank, world_size, args):
     # Initialize metrics logger (only on rank 0)
     metrics_logger = None
     start_epoch = 0
+    # Determine experiment_name (needed for checkpoint naming on all ranks)
+    experiment_name = args.experiment_name or f"{model_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     if rank == 0:
         model_type_str = model_type.upper()
-        experiment_name = args.experiment_name or f"{model_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         metrics_logger = MetricsLogger(args.save_dir, model_type=model_type_str, experiment_name=experiment_name)
         
         # Check for existing checkpoints to resume from (for this specific experiment)
         checkpoint_dir = args.save_dir
         if os.path.exists(checkpoint_dir):
-            checkpoint_files = [f for f in os.listdir(checkpoint_dir) if f.startswith('checkpoint_epoch_') and f.endswith('.pt')]
+            # Look for checkpoints matching this experiment name
+            # Support both old format (checkpoint_epoch_*.pt) and new format ({experiment_name}_checkpoint_epoch_*.pt)
+            checkpoint_files_old = [f for f in os.listdir(checkpoint_dir) if f.startswith('checkpoint_epoch_') and f.endswith('.pt')]
+            checkpoint_files_new = [f for f in os.listdir(checkpoint_dir) if f.startswith(f'{experiment_name}_checkpoint_epoch_') and f.endswith('.pt')]
+            checkpoint_files = checkpoint_files_new if checkpoint_files_new else checkpoint_files_old
+            
             if checkpoint_files:
                 # Extract epoch numbers and find the latest
                 epoch_numbers = []
                 for f in checkpoint_files:
                     try:
-                        epoch_num = int(f.replace('checkpoint_epoch_', '').replace('.pt', ''))
+                        # Handle both formats
+                        if f.startswith(f'{experiment_name}_checkpoint_epoch_'):
+                            epoch_str = f.replace(f'{experiment_name}_checkpoint_epoch_', '').replace('.pt', '')
+                        else:
+                            epoch_str = f.replace('checkpoint_epoch_', '').replace('.pt', '')
+                        epoch_num = int(epoch_str)
                         # Only consider checkpoints that are less than target epochs
                         if epoch_num < args.epochs:
                             epoch_numbers.append(epoch_num)
@@ -848,7 +859,10 @@ def main_worker(rank, world_size, args):
                     checkpoint_loaded = False
                     
                     for epoch_num in epoch_numbers:
-                        checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch_num}.pt')
+                        # Try new format first, fall back to old format
+                        checkpoint_path = os.path.join(checkpoint_dir, f'{experiment_name}_checkpoint_epoch_{epoch_num}.pt')
+                        if not os.path.exists(checkpoint_path):
+                            checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch_num}.pt')
                         
                         if not os.path.exists(checkpoint_path):
                             continue
@@ -1003,31 +1017,34 @@ def main_worker(rank, world_size, args):
                     'train_loss': train_loss,
                 }
                 os.makedirs(args.save_dir, exist_ok=True)
-                checkpoint_path = os.path.join(args.save_dir, f'checkpoint_epoch_{epoch+1}.pt')
+                # Include experiment_name in checkpoint filename to track per-run checkpoints
+                checkpoint_path = os.path.join(args.save_dir, f'{experiment_name}_checkpoint_epoch_{epoch+1}.pt')
                 torch.save(checkpoint, checkpoint_path)
                 print(f"\n✓ Checkpoint saved to {checkpoint_path}")
                 
-                # Delete old checkpoints, keeping the last 10 most recent ones
+                # Delete intermediate checkpoints from the current experiment, keeping only the latest
+                # This ensures we keep only the final checkpoint for each completed run
                 if rank == 0:
-                    checkpoint_pattern = os.path.join(args.save_dir, 'checkpoint_epoch_*.pt')
-                    all_checkpoints = glob.glob(checkpoint_pattern)
-                    keep_last_n = 10  # Keep the last 10 checkpoints
-                    if len(all_checkpoints) > keep_last_n:
+                    checkpoint_pattern = os.path.join(args.save_dir, f'{experiment_name}_checkpoint_epoch_*.pt')
+                    current_run_checkpoints = glob.glob(checkpoint_pattern)
+                    if len(current_run_checkpoints) > 1:
                         # Sort by epoch number (extract from filename)
                         def get_epoch_num(path):
                             basename = os.path.basename(path)
                             try:
-                                return int(basename.replace('checkpoint_epoch_', '').replace('.pt', ''))
+                                # Extract epoch number from: {experiment_name}_checkpoint_epoch_{epoch}.pt
+                                epoch_str = basename.split('_checkpoint_epoch_')[1].replace('.pt', '')
+                                return int(epoch_str)
                             except:
                                 return 0
                         
-                        all_checkpoints.sort(key=get_epoch_num)
-                        # Keep only the most recent N (last N in sorted list)
-                        checkpoints_to_delete = all_checkpoints[:-keep_last_n]
+                        current_run_checkpoints.sort(key=get_epoch_num)
+                        # Keep only the latest checkpoint from this run, delete all others
+                        checkpoints_to_delete = current_run_checkpoints[:-1]
                         for old_checkpoint in checkpoints_to_delete:
                             try:
                                 os.remove(old_checkpoint)
-                                print(f"  Deleted old checkpoint: {os.path.basename(old_checkpoint)}")
+                                print(f"  Deleted intermediate checkpoint: {os.path.basename(old_checkpoint)}")
                             except Exception as e:
                                 print(f"  Warning: Could not delete {old_checkpoint}: {e}")
             except RuntimeError as e:
