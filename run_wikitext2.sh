@@ -27,6 +27,9 @@ echo "Using train.py: $(pwd)/train.py"
 export MASTER_PORT=25419
 export MASTER_ADDR=localhost
 
+# Memory optimization for CUDA
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 # Check if port is in use (optional - uncomment if needed)
 # if lsof -Pi :$MASTER_PORT -sTCP:LISTEN -t >/dev/null ; then
 #     echo "Warning: Port $MASTER_PORT is already in use!"
@@ -59,7 +62,7 @@ torchrun --nproc_per_node=8 --master-port=25419 train.py \
     --hf_tokenizer "gpt2" \
     --hf_text_column "text" \
     --epochs 5 \
-    --batch_size 64 \
+    --batch_size 16 \
     --d_model 768 \
     --n_layers 12 \
     --n_heads 12 \
