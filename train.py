@@ -1000,6 +1000,8 @@ def main_worker(rank, world_size, args):
                     validation_loss_tensor = torch.tensor(validation_loss, device=device)
                     dist.all_reduce(validation_loss_tensor, op=dist.ReduceOp.SUM)
                     validation_loss = validation_loss_tensor.item() / world_size
+                    # Synchronize all processes after validation
+                    dist.barrier()
                 
                 if rank == 0:
                     print(f"  Validation Loss: {validation_loss:.4f}")
@@ -1009,22 +1011,23 @@ def main_worker(rank, world_size, args):
                 metrics_logger.log_epoch(epoch, train_loss, step_losses, validation_loss=validation_loss)
             
             # Save checkpoint (with error handling for disk space issues)
-            try:
-                checkpoint = {
-                    'epoch': epoch,
-                    'model_state_dict': model_for_info.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'train_loss': train_loss,
-                }
-                os.makedirs(args.save_dir, exist_ok=True)
-                # Include experiment_name in checkpoint filename to track per-run checkpoints
-                checkpoint_path = os.path.join(args.save_dir, f'{experiment_name}_checkpoint_epoch_{epoch+1}.pt')
-                torch.save(checkpoint, checkpoint_path)
-                print(f"\n✓ Checkpoint saved to {checkpoint_path}")
-                
-                # Delete intermediate checkpoints from the current experiment, keeping only the latest
-                # This ensures we keep only the final checkpoint for each completed run
-                if rank == 0:
+            # Only rank 0 saves checkpoints to avoid file conflicts
+            if rank == 0:
+                try:
+                    checkpoint = {
+                        'epoch': epoch,
+                        'model_state_dict': model_for_info.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'train_loss': train_loss,
+                    }
+                    os.makedirs(args.save_dir, exist_ok=True)
+                    # Include experiment_name in checkpoint filename to track per-run checkpoints
+                    checkpoint_path = os.path.join(args.save_dir, f'{experiment_name}_checkpoint_epoch_{epoch+1}.pt')
+                    torch.save(checkpoint, checkpoint_path)
+                    print(f"\n✓ Checkpoint saved to {checkpoint_path}")
+                    
+                    # Delete intermediate checkpoints from the current experiment, keeping only the latest
+                    # This ensures we keep only the final checkpoint for each completed run
                     checkpoint_pattern = os.path.join(args.save_dir, f'{experiment_name}_checkpoint_epoch_*.pt')
                     current_run_checkpoints = glob.glob(checkpoint_pattern)
                     if len(current_run_checkpoints) > 1:
@@ -1047,20 +1050,24 @@ def main_worker(rank, world_size, args):
                                 print(f"  Deleted intermediate checkpoint: {os.path.basename(old_checkpoint)}")
                             except Exception as e:
                                 print(f"  Warning: Could not delete {old_checkpoint}: {e}")
-            except RuntimeError as e:
-                if "file write failed" in str(e) or "disk" in str(e).lower() or "space" in str(e).lower():
-                    print(f"\n⚠ Warning: Failed to save checkpoint (likely disk space issue): {e}")
-                    print("Training will continue, but checkpoint was not saved.")
-                    print("Consider downloading/moving old checkpoints to free space:")
-                    print("  # Find large checkpoints: du -h ./checkpoints/*.pt | sort -rh")
-                    print("  # Download old ones: scp user@server:~/jen-mdlm-ar/checkpoints/checkpoint_epoch_*.pt ~/Downloads/")
-                    print("  # Then delete from server if needed: rm ./checkpoints/checkpoint_epoch_{1..50}.pt")
-                else:
+                except RuntimeError as e:
+                    if "file write failed" in str(e) or "disk" in str(e).lower() or "space" in str(e).lower():
+                        print(f"\n⚠ Warning: Failed to save checkpoint (likely disk space issue): {e}")
+                        print("Training will continue, but checkpoint was not saved.")
+                        print("Consider downloading/moving old checkpoints to free space:")
+                        print("  # Find large checkpoints: du -h ./checkpoints/*.pt | sort -rh")
+                        print("  # Download old ones: scp user@server:~/jen-mdlm-ar/checkpoints/checkpoint_epoch_*.pt ~/Downloads/")
+                        print("  # Then delete from server if needed: rm ./checkpoints/checkpoint_epoch_{1..50}.pt")
+                    else:
+                        print(f"\n⚠ Warning: Failed to save checkpoint: {e}")
+                        print("Training will continue, but checkpoint was not saved.")
+                except Exception as e:
                     print(f"\n⚠ Warning: Failed to save checkpoint: {e}")
                     print("Training will continue, but checkpoint was not saved.")
-            except Exception as e:
-                print(f"\n⚠ Warning: Failed to save checkpoint: {e}")
-                print("Training will continue, but checkpoint was not saved.")
+            
+            # Synchronize all processes after checkpoint saving before next epoch
+            if world_size > 1:
+                dist.barrier()
     
     if world_size > 1:
         cleanup_distributed()
