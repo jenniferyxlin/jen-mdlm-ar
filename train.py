@@ -418,7 +418,8 @@ class MetricsLogger:
             'steps': [],
             'step_losses': [],
             'epoch_losses': [],
-            'epoch_avg_losses': []
+            'epoch_avg_losses': [],
+            'validation_losses': []
         }
         self.current_epoch = 0
         self.global_step = 0
@@ -429,13 +430,15 @@ class MetricsLogger:
         self.metrics['steps'].append(self.global_step)
         self.metrics['step_losses'].append(loss)
         
-    def log_epoch(self, epoch, epoch_loss, step_losses=None):
+    def log_epoch(self, epoch, epoch_loss, step_losses=None, validation_loss=None):
         """Log metrics for a completed epoch."""
         self.current_epoch = epoch
         self.metrics['epochs'].append(epoch + 1)
         self.metrics['epoch_losses'].append(epoch_loss)
         if step_losses:
             self.metrics['epoch_avg_losses'].append(sum(step_losses) / len(step_losses))
+        if validation_loss is not None:
+            self.metrics['validation_losses'].append(validation_loss)
         
     def save(self):
         """Save metrics to JSON file."""
@@ -699,6 +702,119 @@ def main_worker(rank, world_size, args):
             sampler = None
             dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
     
+    # Create validation dataloader if using HuggingFace dataset
+    val_dataloader = None
+    if (use_hf_raw or use_hf_data) and rank == 0:
+        # Try to load validation split
+        if use_hf_raw:
+            try:
+                if rank == 0:
+                    print("  Loading validation dataset...")
+                val_ds = load_hf_dataset(
+                    args.hf_raw_repo,
+                    config_name,
+                    'validation',  # Use validation split
+                    rank,
+                    streaming=False  # Don't stream validation
+                )
+                # Apply same preprocessing as training data
+                filtered_val_ds = val_ds.filter(
+                    lambda x: bool(x[args.hf_text_column] and x[args.hf_text_column].strip())
+                )
+                
+                tokenized_val = filtered_val_ds.map(
+                    lambda batch: tokenizer(batch[args.hf_text_column], return_attention_mask=False),
+                    batched=True,
+                    remove_columns=[col for col in filtered_val_ds.column_names if col != "input_ids"]
+                )
+                
+                processed_val_ds = tokenized_val.map(
+                    lambda batch: {
+                        "input_ids": [
+                            sum(batch["input_ids"], [])[i : i + args.hf_block_size]
+                            for i in range(0, (len(sum(batch["input_ids"], [])) // args.hf_block_size) * args.hf_block_size, args.hf_block_size)
+                        ]
+                    },
+                    batched=True
+                )
+                
+                val_dataset = HFRawTextDataset(
+                    processed_val_ds,
+                    max_length=args.hf_block_size,
+                    eod_token=args.eod_token
+                )
+                if world_size > 1:
+                    val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+                    val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, sampler=val_sampler, num_workers=0)
+                else:
+                    val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
+                if rank == 0:
+                    print(f"  Validation dataset loaded: {len(val_dataset)} samples")
+            except Exception as e:
+                if rank == 0:
+                    print(f"  Warning: Could not load validation set: {e}")
+        elif use_hf_data:
+            try:
+                val_dataloader = get_dataloader(
+                    hf_repo=args.hf_repo,
+                    batch_size=args.batch_size,
+                    seq_len=args.max_seq_len,
+                    rank=rank,
+                    world_size=world_size,
+                    split='validation',
+                    max_tokens=None,  # Use all validation data
+                    epoch=0,
+                    version=args.hf_version,
+                    subset=args.hf_subset,
+                    replicate_shards=True,  # All ranks see all validation data
+                    num_workers=0,  # No workers for validation
+                )
+                if rank == 0:
+                    print("  Validation dataloader created")
+            except Exception as e:
+                if rank == 0:
+                    print(f"  Warning: Could not create validation dataloader: {e}")
+    
+    # Broadcast val_dataloader availability to all ranks (simplified: just check if it exists on rank 0)
+    has_val = val_dataloader is not None
+    if world_size > 1:
+        has_val_tensor = torch.tensor([1 if has_val else 0], dtype=torch.long, device=device)
+        dist.broadcast(has_val_tensor, src=0)
+        has_val = bool(has_val_tensor.item())
+        # Other ranks need to create their own validation dataloader if rank 0 has one
+        if has_val and rank > 0:
+            if use_hf_raw:
+                try:
+                    val_ds = load_hf_dataset(args.hf_raw_repo, config_name, 'validation', rank, streaming=False)
+                    filtered_val_ds = val_ds.filter(lambda x: bool(x[args.hf_text_column] and x[args.hf_text_column].strip()))
+                    tokenized_val = filtered_val_ds.map(
+                        lambda batch: tokenizer(batch[args.hf_text_column], return_attention_mask=False),
+                        batched=True, remove_columns=[col for col in filtered_val_ds.column_names if col != "input_ids"]
+                    )
+                    processed_val_ds = tokenized_val.map(
+                        lambda batch: {
+                            "input_ids": [
+                                sum(batch["input_ids"], [])[i : i + args.hf_block_size]
+                                for i in range(0, (len(sum(batch["input_ids"], [])) // args.hf_block_size) * args.hf_block_size, args.hf_block_size)
+                            ]
+                        }, batched=True
+                    )
+                    val_dataset = HFRawTextDataset(processed_val_ds, max_length=args.hf_block_size, eod_token=args.eod_token)
+                    val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+                    val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, sampler=val_sampler, num_workers=0)
+                except:
+                    val_dataloader = None
+            elif use_hf_data:
+                try:
+                    val_dataloader = get_dataloader(
+                        hf_repo=args.hf_repo, batch_size=args.batch_size, seq_len=args.max_seq_len,
+                        rank=rank, world_size=world_size, split='validation', max_tokens=None,
+                        epoch=0, version=args.hf_version, subset=args.hf_subset,
+                        replicate_shards=True, num_workers=0
+                    )
+                except:
+                    val_dataloader = None
+    
     # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     
@@ -855,9 +971,28 @@ def main_worker(rank, world_size, args):
                 improvement_pct = (improvement / prev_loss * 100) if prev_loss > 0 else 0
                 print(f"  Improvement:  {improvement:+.4f} ({improvement_pct:+.2f}%)")
             
+            # Run validation evaluation if validation dataloader is available
+            validation_loss = None
+            if val_dataloader is not None:
+                if rank == 0:
+                    print(f"\n  Running validation evaluation...")
+                if model_type == 'ar':
+                    validation_loss = evaluate_ar(model, val_dataloader, device, args, rank, use_hf_data=use_hf_data)
+                else:
+                    validation_loss = evaluate_mdlm(model, val_dataloader, device, args, rank, use_hf_data=use_hf_data)
+                
+                # Aggregate validation loss across all ranks
+                if world_size > 1:
+                    validation_loss_tensor = torch.tensor(validation_loss, device=device)
+                    dist.all_reduce(validation_loss_tensor, op=dist.ReduceOp.SUM)
+                    validation_loss = validation_loss_tensor.item() / world_size
+                
+                if rank == 0:
+                    print(f"  Validation Loss: {validation_loss:.4f}")
+            
             # Log epoch metrics
             if metrics_logger:
-                metrics_logger.log_epoch(epoch, train_loss, step_losses)
+                metrics_logger.log_epoch(epoch, train_loss, step_losses, validation_loss=validation_loss)
             
             # Save checkpoint (with error handling for disk space issues)
             try:
@@ -1046,7 +1181,7 @@ def main():
     # HuggingFace dataset arguments
     parser.add_argument('--hf_repo', type=str, default=None, 
                         help='HuggingFace dataset repo (e.g., "org/fineweb-edu_gpt2"). If provided, uses pretokenized HF data instead of text file.')
-    parser.add_argument('--hf_split', type=str, default='train', choices=['train', 'validation'],
+    parser.add_argument('--hf_split', type=str, default='train', choices=['train', 'validation', 'test'],
                         help='Dataset split to use (default: train)')
     parser.add_argument('--hf_max_tokens', type=int, default=None,
                         help='Maximum tokens to use from dataset (deterministic subset). None = use all.')

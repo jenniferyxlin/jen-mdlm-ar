@@ -104,6 +104,11 @@ def get_masked_batch(tokens, eps=1e-3, mask_token_id=None, device=None, eod_toke
 def masked_cross_entropy_loss(logits, labels, EOD_mask, masked_indices, p_mask):
     """
     Compute importance-weighted masked cross-entropy loss to get unbiased loss estimates over all positions.
+    Matches pretrain_diff_gpt.py loss calculation:
+    - Computed only on masked tokens
+    - Each loss is divided by its mask probability (p_mask) for unbiased estimation
+    - Normalized by total sequence positions (batch_size * seq_len)
+    - Uses bidirectional attention
     
     Args:
         logits: [batch_size, seq_len, vocab_size] - model predictions
@@ -129,13 +134,12 @@ def masked_cross_entropy_loss(logits, labels, EOD_mask, masked_indices, p_mask):
     masked_losses = losses[masked_indices]
     masked_p = p_mask[masked_indices]
     
-    # Weight by inverse mask probability
+    # Weight by inverse mask probability (importance weighting for unbiased estimation)
     weighted_losses = masked_losses / masked_p
     
-    # Count valid masked positions (masked AND not EOD tokens)
-    valid_masked_count = (masked_indices & (EOD_mask > 0)).sum().float()
-    
-    # Average over valid masked positions (add small epsilon to avoid division by zero)
-    loss = weighted_losses.sum() / (valid_masked_count + 1e-8)
+    # Normalize by total sequence positions (batch_size * seq_len) as in pretrain_diff_gpt.py
+    # This matches the Megatron implementation
+    batch_size, seq_len = logits.shape[:2]
+    loss = weighted_losses.sum() / (batch_size * seq_len)
     
     return loss

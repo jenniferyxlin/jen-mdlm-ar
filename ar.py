@@ -100,7 +100,12 @@ def get_ar_batch(tokens, eod_token=None, eod_mask_loss=True, randmask_ratio=0.0,
 
 def ar_cross_entropy_loss(logits, labels, loss_mask):
     """
-    Compute standard cross-entropy loss for autoregressive models.
+    Compute standard masked cross-entropy loss for autoregressive models.
+    Matches pretrain_gpt.py loss calculation:
+    - Computed on all valid tokens (excluding padding/EOD)
+    - Averaged by the number of valid tokens
+    - Uses causal attention (left-to-right)
+    
     Only computes loss on valid tokens (excludes EOD tokens).
     
     Args:

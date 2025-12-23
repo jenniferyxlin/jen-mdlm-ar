@@ -145,51 +145,41 @@ def plot_epoch_comparison(metrics_files, output_dir='./plots', title_suffix=""):
             for idx, epoch_count in enumerate(common_epochs):
                 ax = axes[idx]
                 
-                # Collect all losses for normalization
-                all_mdlm_losses = []
-                all_ar_losses = []
-                
                 # Get MDLM data
                 mdlm_runs = metrics_by_model_epoch['MDLM'][epoch_count]
                 for _, metrics in mdlm_runs:
                     if 'epoch_losses' in metrics and metrics['epoch_losses']:
-                        all_mdlm_losses.extend(metrics['epoch_losses'])
+                        epochs = list(range(1, len(metrics['epoch_losses']) + 1))
+                        ax.plot(epochs, metrics['epoch_losses'], 
+                               color='#1f77b4', linewidth=2.5, marker='o', 
+                               markersize=5, alpha=0.8, label='MDLM Train', linestyle='-')
+                    # Plot validation loss if available
+                    if 'validation_losses' in metrics and metrics['validation_losses']:
+                        val_epochs = list(range(1, len(metrics['validation_losses']) + 1))
+                        ax.plot(val_epochs, metrics['validation_losses'], 
+                               color='#1f77b4', linewidth=2, marker='o', 
+                               markersize=4, alpha=0.6, label='MDLM Val', linestyle=':')
                 
                 # Get AR data
                 ar_runs = metrics_by_model_epoch['AR'][epoch_count]
                 for _, metrics in ar_runs:
                     if 'epoch_losses' in metrics and metrics['epoch_losses']:
-                        all_ar_losses.extend(metrics['epoch_losses'])
-                
-                # Normalize to [0, 1] range for comparison
-                if all_mdlm_losses and all_ar_losses:
-                    min_loss = min(min(all_mdlm_losses), min(all_ar_losses))
-                    max_loss = max(max(all_mdlm_losses), max(all_ar_losses))
-                    loss_range = max_loss - min_loss if max_loss > min_loss else 1.0
-                    
-                    # Plot normalized MDLM
-                    for _, metrics in mdlm_runs:
-                        if 'epoch_losses' in metrics and metrics['epoch_losses']:
-                            epochs = list(range(1, len(metrics['epoch_losses']) + 1))
-                            normalized = [(l - min_loss) / loss_range for l in metrics['epoch_losses']]
-                            ax.plot(epochs, normalized, 
-                                   color='#1f77b4', linewidth=2.5, marker='o', 
-                                   markersize=5, alpha=0.8, label='MDLM', linestyle='-')
-                    
-                    # Plot normalized AR
-                    for _, metrics in ar_runs:
-                        if 'epoch_losses' in metrics and metrics['epoch_losses']:
-                            epochs = list(range(1, len(metrics['epoch_losses']) + 1))
-                            normalized = [(l - min_loss) / loss_range for l in metrics['epoch_losses']]
-                            ax.plot(epochs, normalized, 
-                                   color='#ff7f0e', linewidth=2.5, marker='s', 
-                                   markersize=5, alpha=0.8, label='AR', linestyle='--')
+                        epochs = list(range(1, len(metrics['epoch_losses']) + 1))
+                        ax.plot(epochs, metrics['epoch_losses'], 
+                               color='#ff7f0e', linewidth=2.5, marker='s', 
+                               markersize=5, alpha=0.8, label='AR Train', linestyle='--')
+                    # Plot validation loss if available
+                    if 'validation_losses' in metrics and metrics['validation_losses']:
+                        val_epochs = list(range(1, len(metrics['validation_losses']) + 1))
+                        ax.plot(val_epochs, metrics['validation_losses'], 
+                               color='#ff7f0e', linewidth=2, marker='s', 
+                               markersize=4, alpha=0.6, label='AR Val', linestyle='-.')
                 
                 ax.set_xlabel('Epoch', fontweight='bold')
-                ax.set_ylabel('Normalized Loss (0=min, 1=max)', fontweight='bold')
-                ax.set_title(f'MDLM vs AR: {epoch_count} Epochs (Normalized for Comparison){title_suffix}', 
+                ax.set_ylabel('Loss', fontweight='bold')
+                ax.set_title(f'MDLM vs AR: {epoch_count} Epochs (Train & Validation){title_suffix}', 
                             fontweight='bold', pad=10)
-                ax.legend(loc='best', framealpha=0.9, fancybox=True, shadow=True)
+                ax.legend(loc='best', framealpha=0.9, fancybox=True, shadow=True, ncol=2)
                 ax.grid(True, alpha=0.3, linestyle='--')
                 ax.set_facecolor('#fafafa')
             
@@ -235,20 +225,8 @@ def plot_epoch_comparison(metrics_files, output_dir='./plots', title_suffix=""):
         if available_milestones:
             fig, ax = plt.subplots(figsize=(12, 7))
             
-            mdlm_orig = [milestone_data['MDLM'].get(m, np.nan) for m in available_milestones]
-            ar_orig = [milestone_data['AR'].get(m, np.nan) for m in available_milestones]
-            
-            # Normalize for comparison
-            all_vals = [v for v in mdlm_orig if not np.isnan(v)] + [v for v in ar_orig if not np.isnan(v)]
-            if all_vals:
-                min_val = min(all_vals)
-                max_val = max(all_vals)
-                val_range = max_val - min_val if max_val > min_val else 1.0
-                mdlm_vals = [(v - min_val) / val_range if not np.isnan(v) else np.nan for v in mdlm_orig]
-                ar_vals = [(v - min_val) / val_range if not np.isnan(v) else np.nan for v in ar_orig]
-            else:
-                mdlm_vals = mdlm_orig
-                ar_vals = ar_orig
+            mdlm_vals = [milestone_data['MDLM'].get(m, np.nan) for m in available_milestones]
+            ar_vals = [milestone_data['AR'].get(m, np.nan) for m in available_milestones]
             
             x = np.arange(len(available_milestones))
             width = 0.35
@@ -258,22 +236,22 @@ def plot_epoch_comparison(metrics_files, output_dir='./plots', title_suffix=""):
             bars2 = ax.bar(x + width/2, ar_vals, width, label='AR', 
                           color='#ff7f0e', alpha=0.8, edgecolor='black', linewidth=1.5)
             
-            # Add value labels on bars (show original values)
-            for bar, val in zip(bars1, mdlm_orig):
-                if not np.isnan(val):
-                    height = bar.get_height()
+            # Add value labels on bars
+            for bar in bars1:
+                height = bar.get_height()
+                if not np.isnan(height):
                     ax.text(bar.get_x() + bar.get_width()/2., height,
-                           f'{val:.3f}', ha='center', va='bottom', fontsize=9)
+                           f'{height:.3f}', ha='center', va='bottom', fontsize=9)
             
-            for bar, val in zip(bars2, ar_orig):
-                if not np.isnan(val):
-                    height = bar.get_height()
+            for bar in bars2:
+                height = bar.get_height()
+                if not np.isnan(height):
                     ax.text(bar.get_x() + bar.get_width()/2., height,
-                           f'{val:.3f}', ha='center', va='bottom', fontsize=9)
+                           f'{height:.3f}', ha='center', va='bottom', fontsize=9)
             
             ax.set_xlabel('Epoch Milestone', fontweight='bold')
-            ax.set_ylabel('Normalized Average Loss (0=min, 1=max)', fontweight='bold')
-            ax.set_title(f'Loss at Fixed Epoch Milestones: MDLM vs AR (Normalized){title_suffix}', 
+            ax.set_ylabel('Average Loss', fontweight='bold')
+            ax.set_title(f'Loss at Fixed Epoch Milestones: MDLM vs AR{title_suffix}', 
                         fontweight='bold', pad=20)
             ax.set_xticks(x)
             ax.set_xticklabels([f'Epoch {m}' for m in available_milestones])
@@ -291,63 +269,57 @@ def plot_epoch_comparison(metrics_files, output_dir='./plots', title_suffix=""):
     if 'MDLM' in metrics_by_model_epoch and 'AR' in metrics_by_model_epoch:
         fig, ax = plt.subplots(figsize=(12, 8))
         
-        # Collect final losses
-        mdlm_data = []
-        ar_data = []
+        # Collect final losses (both train and validation)
+        mdlm_train_data = []
+        mdlm_val_data = []
+        ar_train_data = []
+        ar_val_data = []
         
         for epoch_count in sorted(metrics_by_model_epoch['MDLM'].keys()):
             runs = metrics_by_model_epoch['MDLM'][epoch_count]
             for _, metrics in runs:
                 if 'epoch_losses' in metrics and metrics['epoch_losses']:
-                    mdlm_data.append((epoch_count, metrics['epoch_losses'][-1]))
+                    mdlm_train_data.append((epoch_count, metrics['epoch_losses'][-1]))
+                if 'validation_losses' in metrics and metrics['validation_losses']:
+                    mdlm_val_data.append((epoch_count, metrics['validation_losses'][-1]))
         
         for epoch_count in sorted(metrics_by_model_epoch['AR'].keys()):
             runs = metrics_by_model_epoch['AR'][epoch_count]
             for _, metrics in runs:
                 if 'epoch_losses' in metrics and metrics['epoch_losses']:
-                    ar_data.append((epoch_count, metrics['epoch_losses'][-1]))
+                    ar_train_data.append((epoch_count, metrics['epoch_losses'][-1]))
+                if 'validation_losses' in metrics and metrics['validation_losses']:
+                    ar_val_data.append((epoch_count, metrics['validation_losses'][-1]))
         
-        # Normalize losses for comparison
-        if mdlm_data and ar_data:
-            all_losses = [y for _, y in mdlm_data] + [y for _, y in ar_data]
-            min_loss = min(all_losses)
-            max_loss = max(all_losses)
-            loss_range = max_loss - min_loss if max_loss > min_loss else 1.0
-            
-            mdlm_x, mdlm_y = zip(*sorted(mdlm_data))
-            mdlm_y_norm = [(y - min_loss) / loss_range for y in mdlm_y]
-            ax.plot(mdlm_x, mdlm_y_norm, 'o-', color='#1f77b4', linewidth=3, 
-                   markersize=10, label='MDLM', alpha=0.8, markeredgecolor='black', 
+        # Plot training losses
+        if mdlm_train_data:
+            mdlm_x, mdlm_y = zip(*sorted(mdlm_train_data))
+            ax.plot(mdlm_x, mdlm_y, 'o-', color='#1f77b4', linewidth=3, 
+                   markersize=10, label='MDLM Train', alpha=0.8, markeredgecolor='black', 
                    markeredgewidth=1.5)
-            for x, y, y_norm in zip(mdlm_x, mdlm_y, mdlm_y_norm):
-                ax.annotate(f'{y:.2f}', (x, y_norm), textcoords="offset points", 
-                           xytext=(0,10), ha='center', fontsize=9)
-            
-            ar_x, ar_y = zip(*sorted(ar_data))
-            ar_y_norm = [(y - min_loss) / loss_range for y in ar_y]
-            ax.plot(ar_x, ar_y_norm, 's--', color='#ff7f0e', linewidth=3, 
-                   markersize=10, label='AR', alpha=0.8, markeredgecolor='black', 
+        
+        if ar_train_data:
+            ar_x, ar_y = zip(*sorted(ar_train_data))
+            ax.plot(ar_x, ar_y, 's--', color='#ff7f0e', linewidth=3, 
+                   markersize=10, label='AR Train', alpha=0.8, markeredgecolor='black', 
                    markeredgewidth=1.5)
-            for x, y, y_norm in zip(ar_x, ar_y, ar_y_norm):
-                ax.annotate(f'{y:.2f}', (x, y_norm), textcoords="offset points", 
-                           xytext=(0,10), ha='center', fontsize=9)
-            
-            ax.set_ylabel('Normalized Final Loss (0=min, 1=max)', fontweight='bold')
-        else:
-            if mdlm_data:
-                mdlm_x, mdlm_y = zip(*sorted(mdlm_data))
-                ax.plot(mdlm_x, mdlm_y, 'o-', color='#1f77b4', linewidth=3, 
-                       markersize=10, label='MDLM', alpha=0.8, markeredgecolor='black', 
-                       markeredgewidth=1.5)
-            if ar_data:
-                ar_x, ar_y = zip(*sorted(ar_data))
-                ax.plot(ar_x, ar_y, 's--', color='#ff7f0e', linewidth=3, 
-                       markersize=10, label='AR', alpha=0.8, markeredgecolor='black', 
-                       markeredgewidth=1.5)
-            ax.set_ylabel('Final Loss', fontweight='bold')
+        
+        # Plot validation losses if available
+        if mdlm_val_data:
+            mdlm_val_x, mdlm_val_y = zip(*sorted(mdlm_val_data))
+            ax.plot(mdlm_val_x, mdlm_val_y, 'o:', color='#1f77b4', linewidth=2.5, 
+                   markersize=8, label='MDLM Val', alpha=0.7, markeredgecolor='black', 
+                   markeredgewidth=1.2)
+        
+        if ar_val_data:
+            ar_val_x, ar_val_y = zip(*sorted(ar_val_data))
+            ax.plot(ar_val_x, ar_val_y, 's-.', color='#ff7f0e', linewidth=2.5, 
+                   markersize=8, label='AR Val', alpha=0.7, markeredgecolor='black', 
+                   markeredgewidth=1.2)
         
         ax.set_xlabel('Number of Training Epochs', fontweight='bold')
-        ax.set_title(f'Final Loss vs Training Duration: MDLM vs AR (Normalized){title_suffix}', 
+        ax.set_ylabel('Final Loss', fontweight='bold')
+        ax.set_title(f'Final Loss vs Training Duration: MDLM vs AR (Train & Validation){title_suffix}', 
                      fontweight='bold', pad=20)
         ax.legend(loc='best', framealpha=0.9, fancybox=True, shadow=True, fontsize=12)
         ax.grid(True, alpha=0.3, linestyle='--')
@@ -366,43 +338,23 @@ def plot_epoch_comparison(metrics_files, output_dir='./plots', title_suffix=""):
         common_epochs = sorted(set(metrics_by_model_epoch['MDLM'].keys()) & 
                              set(metrics_by_model_epoch['AR'].keys()))
         
-        # Collect all losses for normalization
-        all_losses = []
         for epoch_count in common_epochs:
-            mdlm_runs = metrics_by_model_epoch['MDLM'][epoch_count]
-            ar_runs = metrics_by_model_epoch['AR'][epoch_count]
-            for _, metrics in mdlm_runs:
-                if 'epoch_losses' in metrics and metrics['epoch_losses']:
-                    all_losses.extend(metrics['epoch_losses'])
-            for _, metrics in ar_runs:
-                if 'epoch_losses' in metrics and metrics['epoch_losses']:
-                    all_losses.extend(metrics['epoch_losses'])
-        
-        # Normalize to [0, 1] range
-        if all_losses:
-            min_loss = min(all_losses)
-            max_loss = max(all_losses)
-            loss_range = max_loss - min_loss if max_loss > min_loss else 1.0
-        
-        for epoch_count in common_epochs:
-            # Plot normalized MDLM
+            # Plot MDLM
             mdlm_runs = metrics_by_model_epoch['MDLM'][epoch_count]
             for _, metrics in mdlm_runs:
                 if 'epoch_losses' in metrics and metrics['epoch_losses']:
                     epochs = list(range(1, len(metrics['epoch_losses']) + 1))
-                    normalized = [(l - min_loss) / loss_range for l in metrics['epoch_losses']]
-                    ax.plot(epochs, normalized, 
+                    ax.plot(epochs, metrics['epoch_losses'], 
                            color='#1f77b4', linewidth=2, marker='o', markersize=4, 
                            alpha=0.7, linestyle='-', 
                            label=f'MDLM ({epoch_count} epochs)' if epoch_count == common_epochs[0] else '')
             
-            # Plot normalized AR
+            # Plot AR
             ar_runs = metrics_by_model_epoch['AR'][epoch_count]
             for _, metrics in ar_runs:
                 if 'epoch_losses' in metrics and metrics['epoch_losses']:
                     epochs = list(range(1, len(metrics['epoch_losses']) + 1))
-                    normalized = [(l - min_loss) / loss_range for l in metrics['epoch_losses']]
-                    ax.plot(epochs, normalized, 
+                    ax.plot(epochs, metrics['epoch_losses'], 
                            color='#ff7f0e', linewidth=2, marker='s', markersize=4, 
                            alpha=0.7, linestyle='--',
                            label=f'AR ({epoch_count} epochs)' if epoch_count == common_epochs[0] else '')
@@ -412,14 +364,19 @@ def plot_epoch_comparison(metrics_files, output_dir='./plots', title_suffix=""):
         legend_elements = []
         for epoch_count in common_epochs:
             legend_elements.append(Line2D([0], [0], color='#1f77b4', linewidth=2.5, 
-                                         marker='o', label=f'MDLM ({epoch_count} epochs)'))
+                                         marker='o', linestyle='-', label=f'MDLM Train ({epoch_count} epochs)'))
+            legend_elements.append(Line2D([0], [0], color='#1f77b4', linewidth=1.5, 
+                                         marker='o', linestyle=':', alpha=0.6, label=f'MDLM Val ({epoch_count} epochs)'))
             legend_elements.append(Line2D([0], [0], color='#ff7f0e', linewidth=2.5, 
                                          marker='s', linestyle='--', 
-                                         label=f'AR ({epoch_count} epochs)'))
+                                         label=f'AR Train ({epoch_count} epochs)'))
+            legend_elements.append(Line2D([0], [0], color='#ff7f0e', linewidth=1.5, 
+                                         marker='s', linestyle='-.', alpha=0.6, 
+                                         label=f'AR Val ({epoch_count} epochs)'))
         
         ax.set_xlabel('Epoch', fontweight='bold')
-        ax.set_ylabel('Normalized Loss (0=min, 1=max)', fontweight='bold')
-        ax.set_title(f'MDLM vs AR Training Loss Comparison - Normalized{title_suffix}', 
+        ax.set_ylabel('Loss', fontweight='bold')
+        ax.set_title(f'MDLM vs AR Loss Comparison - Train & Validation (All Runs){title_suffix}', 
                      fontweight='bold', pad=20)
         ax.legend(handles=legend_elements, loc='best', framealpha=0.9, 
                  fancybox=True, shadow=True, ncol=2, fontsize=9)
