@@ -14,6 +14,7 @@ from torch.utils.data.distributed import DistributedSampler
 import yaml
 import json
 import time
+import glob
 from datetime import datetime
 
 from mdlm import MDLModel
@@ -858,16 +859,56 @@ def main_worker(rank, world_size, args):
             if metrics_logger:
                 metrics_logger.log_epoch(epoch, train_loss, step_losses)
             
-            # Save checkpoint
-            checkpoint = {
-                'epoch': epoch,
-                'model_state_dict': model_for_info.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'train_loss': train_loss,
-            }
-            os.makedirs(args.save_dir, exist_ok=True)
-            torch.save(checkpoint, os.path.join(args.save_dir, f'checkpoint_epoch_{epoch+1}.pt'))
-            print(f"\n✓ Checkpoint saved to {args.save_dir}/checkpoint_epoch_{epoch+1}.pt")
+            # Save checkpoint (with error handling for disk space issues)
+            try:
+                checkpoint = {
+                    'epoch': epoch,
+                    'model_state_dict': model_for_info.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'train_loss': train_loss,
+                }
+                os.makedirs(args.save_dir, exist_ok=True)
+                checkpoint_path = os.path.join(args.save_dir, f'checkpoint_epoch_{epoch+1}.pt')
+                torch.save(checkpoint, checkpoint_path)
+                print(f"\n✓ Checkpoint saved to {checkpoint_path}")
+                
+                # Delete old checkpoints, keeping the last 10 most recent ones
+                if rank == 0:
+                    checkpoint_pattern = os.path.join(args.save_dir, 'checkpoint_epoch_*.pt')
+                    all_checkpoints = glob.glob(checkpoint_pattern)
+                    keep_last_n = 10  # Keep the last 10 checkpoints
+                    if len(all_checkpoints) > keep_last_n:
+                        # Sort by epoch number (extract from filename)
+                        def get_epoch_num(path):
+                            basename = os.path.basename(path)
+                            try:
+                                return int(basename.replace('checkpoint_epoch_', '').replace('.pt', ''))
+                            except:
+                                return 0
+                        
+                        all_checkpoints.sort(key=get_epoch_num)
+                        # Keep only the most recent N (last N in sorted list)
+                        checkpoints_to_delete = all_checkpoints[:-keep_last_n]
+                        for old_checkpoint in checkpoints_to_delete:
+                            try:
+                                os.remove(old_checkpoint)
+                                print(f"  Deleted old checkpoint: {os.path.basename(old_checkpoint)}")
+                            except Exception as e:
+                                print(f"  Warning: Could not delete {old_checkpoint}: {e}")
+            except RuntimeError as e:
+                if "file write failed" in str(e) or "disk" in str(e).lower() or "space" in str(e).lower():
+                    print(f"\n⚠ Warning: Failed to save checkpoint (likely disk space issue): {e}")
+                    print("Training will continue, but checkpoint was not saved.")
+                    print("Consider downloading/moving old checkpoints to free space:")
+                    print("  # Find large checkpoints: du -h ./checkpoints/*.pt | sort -rh")
+                    print("  # Download old ones: scp user@server:~/jen-mdlm-ar/checkpoints/checkpoint_epoch_*.pt ~/Downloads/")
+                    print("  # Then delete from server if needed: rm ./checkpoints/checkpoint_epoch_{1..50}.pt")
+                else:
+                    print(f"\n⚠ Warning: Failed to save checkpoint: {e}")
+                    print("Training will continue, but checkpoint was not saved.")
+            except Exception as e:
+                print(f"\n⚠ Warning: Failed to save checkpoint: {e}")
+                print("Training will continue, but checkpoint was not saved.")
     
     if world_size > 1:
         cleanup_distributed()
