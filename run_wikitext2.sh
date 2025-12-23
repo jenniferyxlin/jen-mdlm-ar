@@ -34,7 +34,7 @@ export MASTER_ADDR=localhost
 # fi
 
 # Option 1: Run in background with nohup (recommended for long training)
-# nohup torchrun --nproc_per_node=8 train.py \
+# nohup torchrun --nproc_per_node=8 --master-port=25419 train.py \
 #     --distributed \
 #     --hf_raw_repo "Salesforce/wikitext" \
 #     --hf_raw_split "wikitext-2-v1" \
@@ -52,7 +52,7 @@ export MASTER_ADDR=localhost
 #     --save_dir ./checkpoints > training.log 2>&1 &
 
 # Option 2: Run in foreground (see output in real-time)
-torchrun --nproc_per_node=8 train.py \
+torchrun --nproc_per_node=8 --master-port=25419 train.py \
     --distributed \
     --hf_raw_repo "Salesforce/wikitext" \
     --hf_raw_split "wikitext-2-v1" \
