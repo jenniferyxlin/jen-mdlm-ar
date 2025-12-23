@@ -12,6 +12,8 @@ import os
 import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
 import yaml
+import json
+from datetime import datetime
 
 from model import MDLModel
 from diffusion import get_masked_batch, masked_cross_entropy_loss
@@ -96,10 +98,48 @@ class HFRawTextDataset(Dataset):
         return token_ids
 
 
-def setup_distributed(rank, world_size, backend='nccl'):
+def setup_distributed(rank, world_size, backend='nccl', master_port=None):
     """Initialize distributed training."""
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
+    # Always respect MASTER_PORT if set in environment (from torchrun or user)
+    # Only set it if not already present
+    if 'MASTER_ADDR' not in os.environ:
+        os.environ['MASTER_ADDR'] = 'localhost'
+    
+    # MASTER_PORT priority: function arg > environment variable > default
+    # If master_port is explicitly provided, use it (overrides environment)
+    # Otherwise, use environment if set, or default to 25419
+    # Special case: if torchrun set it to 12355 (default) but we want 25419, override it
+    target_port = None
+    if master_port:
+        target_port = str(master_port)
+    elif 'MASTER_PORT' in os.environ:
+        env_port = os.environ['MASTER_PORT']
+        # If it's 12355 (torchrun default) and we want 25419, override it
+        if env_port == '12355':
+            target_port = '25419'  # Override torchrun's default
+        else:
+            target_port = env_port  # Use what's in environment
+    else:
+        target_port = '25419'  # Default
+    
+    # Set the port - CRITICAL: must be set before init_process_group
+    os.environ['MASTER_PORT'] = target_port
+    
+    # Double-check it's set correctly (sometimes torchrun overrides it)
+    if os.environ.get('MASTER_PORT') != target_port:
+        print(f"[WARNING] MASTER_PORT was overridden! Expected {target_port}, got {os.environ.get('MASTER_PORT')}")
+        os.environ['MASTER_PORT'] = target_port
+    
+    # Debug: Print which port we're using (only on rank 0)
+    if rank == 0:
+        actual_port = os.environ.get('MASTER_PORT', 'NOT SET')
+        actual_addr = os.environ.get('MASTER_ADDR', 'NOT SET')
+        print(f"[DEBUG] Distributed setup:")
+        print(f"[DEBUG]   MASTER_ADDR={actual_addr}")
+        print(f"[DEBUG]   MASTER_PORT={actual_port}")
+        print(f"[DEBUG]   RANK={rank}, WORLD_SIZE={world_size}")
+        if actual_port == '12355':
+            print(f"[WARNING] Port is 12355 - this might cause conflicts!")
     
     # Initialize process group
     dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
@@ -113,16 +153,19 @@ def cleanup_distributed():
     dist.destroy_process_group()
 
 
-def train_epoch(model, dataloader, optimizer, device, args, rank=0, use_hf_data=False):
+def train_epoch(model, dataloader, optimizer, device, args, rank=0, use_hf_data=False, metrics_logger=None, epoch_num=0):
     """Train for one epoch."""
     model.train()
     total_loss = 0
     n_batches = 0
+    step_losses = []  # Track losses per step for visualization
+    running_avg_window = 100  # Window for running average
+    recent_losses = []  # Track recent losses for running average
     
     # Use tqdm only on rank 0
-    pbar = tqdm(dataloader, desc="Training", disable=(rank != 0)) if rank == 0 else dataloader
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch_num+1}", disable=(rank != 0)) if rank == 0 else dataloader
     
-    for batch in pbar:
+    for step, batch in enumerate(pbar):
         # Handle HuggingFace data format (x, y) tuples vs simple token tensors
         if use_hf_data:
             x, y = batch
@@ -153,14 +196,31 @@ def train_epoch(model, dataloader, optimizer, device, args, rank=0, use_hf_data=
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
         optimizer.step()
         
-        total_loss += loss.item()
+        loss_value = loss.item()
+        total_loss += loss_value
         n_batches += 1
+        step_losses.append(loss_value)
         
-        # Update progress bar
+        # Track running average
+        recent_losses.append(loss_value)
+        if len(recent_losses) > running_avg_window:
+            recent_losses.pop(0)
+        running_avg = sum(recent_losses) / len(recent_losses) if recent_losses else loss_value
+        
+        # Log step-level metrics
+        if metrics_logger is not None and rank == 0:
+            metrics_logger.log_step(step, loss_value, total_loss / n_batches)
+        
+        # Update progress bar with enhanced loss info
         if rank == 0:
-            pbar.set_postfix({'loss': loss.item(), 'avg_loss': total_loss / n_batches})
+            pbar.set_postfix({
+                'loss': f'{loss_value:.4f}',
+                'avg': f'{total_loss / n_batches:.4f}',
+                'run_avg': f'{running_avg:.4f}'
+            })
     
-    return total_loss / n_batches
+    avg_loss = total_loss / n_batches
+    return avg_loss, step_losses
 
 
 def evaluate(model, dataloader, device, args, rank=0, use_hf_data=False):
@@ -202,11 +262,61 @@ def evaluate(model, dataloader, device, args, rank=0, use_hf_data=False):
     return total_loss / n_batches
 
 
+class MetricsLogger:
+    """Logger for training metrics to enable visualization and comparison."""
+    
+    def __init__(self, save_dir, model_type="MDLM", experiment_name=None):
+        self.save_dir = save_dir
+        self.model_type = model_type
+        self.experiment_name = experiment_name or f"{model_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        os.makedirs(save_dir, exist_ok=True)
+        
+        self.metrics = {
+            'model_type': model_type,
+            'experiment_name': self.experiment_name,
+            'start_time': datetime.now().isoformat(),
+            'epochs': [],
+            'steps': [],
+            'step_losses': [],
+            'epoch_losses': [],
+            'epoch_avg_losses': []
+        }
+        self.current_epoch = 0
+        self.global_step = 0
+        
+    def log_step(self, step, loss, avg_loss):
+        """Log metrics for a single training step."""
+        self.global_step += 1
+        self.metrics['steps'].append(self.global_step)
+        self.metrics['step_losses'].append(loss)
+        
+    def log_epoch(self, epoch, epoch_loss, step_losses=None):
+        """Log metrics for a completed epoch."""
+        self.current_epoch = epoch
+        self.metrics['epochs'].append(epoch + 1)
+        self.metrics['epoch_losses'].append(epoch_loss)
+        if step_losses:
+            self.metrics['epoch_avg_losses'].append(sum(step_losses) / len(step_losses))
+        
+    def save(self):
+        """Save metrics to JSON file."""
+        self.metrics['end_time'] = datetime.now().isoformat()
+        metrics_file = os.path.join(self.save_dir, f'{self.experiment_name}_metrics.json')
+        with open(metrics_file, 'w') as f:
+            json.dump(self.metrics, f, indent=2)
+        return metrics_file
+
+
 def main_worker(rank, world_size, args):
     """Main training function for distributed training."""
+    # If using torchrun, get rank and world_size from environment
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+    
     # Setup distributed training
     if world_size > 1:
-        setup_distributed(rank, world_size)
+        setup_distributed(rank, world_size, master_port=args.master_port)
         device = torch.device(f'cuda:{rank}')
         torch.cuda.set_device(rank)
     else:
@@ -238,11 +348,164 @@ def main_worker(rank, world_size, args):
         print(f"Using RoPE: {args.use_rope}")
     
     # Determine data source and create dataloader
-    use_hf_data = args.hf_repo is not None
+    # Priority: hf_raw_repo > hf_repo > simple text dataset
+    # (hf_raw_repo takes precedence if both are set)
     use_hf_raw = args.hf_raw_repo is not None
+    use_hf_data = args.hf_repo is not None and not use_hf_raw  # Only use if hf_raw_repo is not set
     sampler = None  # Only used for simple text dataset with distributed training
     
-    if use_hf_data:
+    if use_hf_raw:
+        # Use raw HuggingFace dataset with proper preprocessing pipeline
+        from datasets import load_dataset
+        from transformers import AutoTokenizer
+        
+        # hf_raw_split can be a config name (e.g., "wikitext-2-v1") or None
+        config_name = args.hf_raw_split
+        # hf_split is the actual split to use (train, test, validation)
+        split_to_use = args.hf_split
+        
+        if rank == 0:
+            print(f"Loading raw dataset from HuggingFace: {args.hf_raw_repo}")
+            if config_name:
+                print(f"  Config: {config_name}")
+            print(f"  Split: {split_to_use}")
+            print(f"  Streaming: {args.hf_streaming}")
+            print(f"  Tokenizer: {args.hf_tokenizer}")
+            print(f"  Text column: {args.hf_text_column}")
+        
+        # Set default block_size to max_seq_len if not provided
+        if args.hf_block_size is None:
+            args.hf_block_size = args.max_seq_len
+        
+        if rank == 0:
+            print(f"  Block size: {args.hf_block_size}")
+        
+        # Load dataset (with streaming support)
+        # If hf_raw_split is provided, use it as config name; otherwise load without config
+        if args.hf_streaming:
+            if config_name:
+                ds = load_dataset(args.hf_raw_repo, config_name, streaming=True, split=split_to_use)
+            else:
+                ds = load_dataset(args.hf_raw_repo, streaming=True, split=split_to_use)
+            train_ds = ds
+        else:
+            # Load dataset (only on rank 0 to avoid multiple downloads)
+            if rank == 0:
+                if config_name:
+                    hf_dataset = load_dataset(args.hf_raw_repo, config_name)
+                else:
+                    hf_dataset = load_dataset(args.hf_raw_repo)
+                # Get the requested split
+                train_ds = hf_dataset[split_to_use] if isinstance(hf_dataset, dict) and split_to_use in hf_dataset else hf_dataset
+            else:
+                # Other ranks wait a bit then load
+                import time
+                time.sleep(1)
+                if config_name:
+                    hf_dataset = load_dataset(args.hf_raw_repo, config_name)
+                else:
+                    hf_dataset = load_dataset(args.hf_raw_repo)
+                train_ds = hf_dataset[split_to_use] if isinstance(hf_dataset, dict) and split_to_use in hf_dataset else hf_dataset
+        
+        # Load tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(args.hf_tokenizer)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        
+        # Update vocab_size from tokenizer if needed
+        if args.vocab_size == 50257:  # Default value
+            args.vocab_size = len(tokenizer)
+            if rank == 0:
+                print(f"  Using vocab_size from tokenizer: {args.vocab_size}")
+        
+        # Set EOD token from tokenizer
+        if args.eod_token is None or args.eod_token == args.vocab_size - 1:
+            args.eod_token = tokenizer.eos_token_id or args.vocab_size - 1
+        
+        # Preprocessing pipeline
+        if rank == 0:
+            print("  Preprocessing dataset: filtering empty rows...")
+        
+        # Step 1: Filter empty/newline-only rows
+        filtered_ds = train_ds.filter(
+            lambda x: bool(x[args.hf_text_column] and x[args.hf_text_column].strip())
+        )
+        
+        if rank == 0:
+            print("  Tokenizing dataset (batched)...")
+        
+        # Step 2: Tokenize in batches
+        def tokenize(batch):
+            """Tokenize text batches."""
+            return tokenizer(batch[args.hf_text_column], return_attention_mask=False)
+        
+        tokenized = filtered_ds.map(
+            tokenize,
+            batched=True,
+            remove_columns=[col for col in filtered_ds.column_names if col != "input_ids"]
+        )
+        
+        if rank == 0:
+            print(f"  Chunking sequences into blocks of size {args.hf_block_size}...")
+        
+        # Step 3: Chunk sequences into fixed-size blocks
+        block_size = args.hf_block_size
+        
+        def chunk(batch):
+            """Concatenate and chunk sequences."""
+            concatenated = sum(batch["input_ids"], [])
+            total_len = (len(concatenated) // block_size) * block_size
+            return {
+                "input_ids": [
+                    concatenated[i : i + block_size]
+                    for i in range(0, total_len, block_size)
+                ]
+            }
+        
+        processed_ds = tokenized.map(chunk, batched=True)
+        
+        # For streaming datasets, we need to use IterableDataset
+        if args.hf_streaming:
+            from torch.utils.data import IterableDataset
+            
+            # Convert to IterableDataset for streaming
+            # Note: streaming datasets can't use DistributedSampler easily
+            class StreamingDatasetWrapper(IterableDataset):
+                def __init__(self, stream_ds, rank, world_size):
+                    self.stream_ds = stream_ds
+                    self.rank = rank
+                    self.world_size = world_size
+                
+                def __iter__(self):
+                    for i, item in enumerate(self.stream_ds):
+                        # Simple round-robin for distributed
+                        if i % self.world_size == self.rank:
+                            yield torch.tensor(item["input_ids"], dtype=torch.long)
+            
+            dataset = StreamingDatasetWrapper(processed_ds, rank, world_size)
+            # For streaming, we can't use DistributedSampler
+            sampler = None
+            dataloader = DataLoader(
+                dataset,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers or 0
+            )
+        else:
+            # Create dataset wrapper
+            dataset = HFRawTextDataset(
+                processed_ds,
+                max_length=args.hf_block_size,
+                eod_token=args.eod_token
+            )
+            
+            # Create distributed sampler if using multiple GPUs
+            if world_size > 1:
+                sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
+                dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, num_workers=args.num_workers or 0)
+            else:
+                sampler = None
+                dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers or 0)
+    elif use_hf_data:
         # Use HuggingFace pretokenized dataset
         if rank == 0:
             print(f"Loading pretokenized dataset from HuggingFace: {args.hf_repo}")
@@ -269,10 +532,16 @@ def main_worker(rank, world_size, args):
         from datasets import load_dataset
         from transformers import AutoTokenizer
         
+        # hf_raw_split can be a config name (e.g., "wikitext-2-v1") or None
+        config_name = args.hf_raw_split
+        # hf_split is the actual split to use (train, test, validation)
+        split_to_use = args.hf_split
+        
         if rank == 0:
             print(f"Loading raw dataset from HuggingFace: {args.hf_raw_repo}")
-            split_name = args.hf_raw_split or args.hf_split
-            print(f"  Split: {split_name}")
+            if config_name:
+                print(f"  Config: {config_name}")
+            print(f"  Split: {split_to_use}")
             print(f"  Streaming: {args.hf_streaming}")
             print(f"  Tokenizer: {args.hf_tokenizer}")
             print(f"  Text column: {args.hf_text_column}")
@@ -285,20 +554,31 @@ def main_worker(rank, world_size, args):
             print(f"  Block size: {args.hf_block_size}")
         
         # Load dataset (with streaming support)
+        # If hf_raw_split is provided, use it as config name; otherwise load without config
         if args.hf_streaming:
-            ds = load_dataset(args.hf_raw_repo, split_name, streaming=True)
-            train_ds = ds["train"] if isinstance(ds, dict) else ds
+            if config_name:
+                ds = load_dataset(args.hf_raw_repo, config_name, streaming=True, split=split_to_use)
+            else:
+                ds = load_dataset(args.hf_raw_repo, streaming=True, split=split_to_use)
+            train_ds = ds
         else:
             # Load dataset (only on rank 0 to avoid multiple downloads)
             if rank == 0:
-                hf_dataset = load_dataset(args.hf_raw_repo, split_name)
-                train_ds = hf_dataset["train"] if isinstance(hf_dataset, dict) else hf_dataset
+                if config_name:
+                    hf_dataset = load_dataset(args.hf_raw_repo, config_name)
+                else:
+                    hf_dataset = load_dataset(args.hf_raw_repo)
+                # Get the requested split
+                train_ds = hf_dataset[split_to_use] if isinstance(hf_dataset, dict) and split_to_use in hf_dataset else hf_dataset
             else:
                 # Other ranks wait a bit then load
                 import time
                 time.sleep(1)
-                hf_dataset = load_dataset(args.hf_raw_repo, split_name)
-                train_ds = hf_dataset["train"] if isinstance(hf_dataset, dict) else hf_dataset
+                if config_name:
+                    hf_dataset = load_dataset(args.hf_raw_repo, config_name)
+                else:
+                    hf_dataset = load_dataset(args.hf_raw_repo)
+                train_ds = hf_dataset[split_to_use] if isinstance(hf_dataset, dict) and split_to_use in hf_dataset else hf_dataset
         
         # Load tokenizer
         tokenizer = AutoTokenizer.from_pretrained(args.hf_tokenizer)
@@ -432,11 +712,19 @@ def main_worker(rank, world_size, args):
     # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     
+    # Initialize metrics logger (only on rank 0)
+    metrics_logger = None
+    if rank == 0:
+        experiment_name = args.experiment_name or f"mdlm_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        metrics_logger = MetricsLogger(args.save_dir, model_type="MDLM", experiment_name=experiment_name)
+    
     # Training loop
     if rank == 0:
         print(f"Starting training on {device}...")
         if world_size > 1:
             print(f"Using {world_size} GPUs with distributed training")
+        if metrics_logger:
+            print(f"Metrics will be saved to: {metrics_logger.save_dir}")
     
     for epoch in range(args.epochs):
         # Update epoch for HuggingFace dataloader (for shard shuffling)
@@ -459,12 +747,35 @@ def main_worker(rank, world_size, args):
             sampler.set_epoch(epoch)
         
         if rank == 0:
-            print(f"\nEpoch {epoch + 1}/{args.epochs}")
+            print(f"\n{'='*60}")
+            print(f"Epoch {epoch + 1}/{args.epochs}")
+            print(f"{'='*60}")
         
-        train_loss = train_epoch(model, dataloader, optimizer, device, args, rank, use_hf_data=use_hf_data)
+        train_loss, step_losses = train_epoch(model, dataloader, optimizer, device, args, rank, use_hf_data=use_hf_data, metrics_logger=metrics_logger, epoch_num=epoch)
         
         if rank == 0:
-            print(f"Train loss: {train_loss:.4f}")
+            # Calculate additional statistics
+            min_loss = min(step_losses) if step_losses else train_loss
+            max_loss = max(step_losses) if step_losses else train_loss
+            std_loss = (sum((x - train_loss)**2 for x in step_losses) / len(step_losses))**0.5 if step_losses else 0.0
+            
+            print(f"\nEpoch {epoch + 1} Summary:")
+            print(f"  Average Loss: {train_loss:.4f}")
+            print(f"  Min Loss:     {min_loss:.4f}")
+            print(f"  Max Loss:     {max_loss:.4f}")
+            print(f"  Std Dev:      {std_loss:.4f}")
+            print(f"  Steps:        {len(step_losses)}")
+            
+            # Show improvement if not first epoch
+            if epoch > 0 and metrics_logger and len(metrics_logger.metrics['epoch_losses']) > 1:
+                prev_loss = metrics_logger.metrics['epoch_losses'][-2]
+                improvement = prev_loss - train_loss
+                improvement_pct = (improvement / prev_loss * 100) if prev_loss > 0 else 0
+                print(f"  Improvement:  {improvement:+.4f} ({improvement_pct:+.2f}%)")
+            
+            # Log epoch metrics
+            if metrics_logger:
+                metrics_logger.log_epoch(epoch, train_loss, step_losses)
             
             # Save checkpoint
             checkpoint = {
@@ -475,13 +786,64 @@ def main_worker(rank, world_size, args):
             }
             os.makedirs(args.save_dir, exist_ok=True)
             torch.save(checkpoint, os.path.join(args.save_dir, f'checkpoint_epoch_{epoch+1}.pt'))
-            print(f"Saved checkpoint to {args.save_dir}")
+            print(f"\n✓ Checkpoint saved to {args.save_dir}/checkpoint_epoch_{epoch+1}.pt")
     
     if world_size > 1:
         cleanup_distributed()
     
     if rank == 0:
-        print("Training complete!")
+        print(f"\n{'='*60}")
+        print("Training Complete!")
+        print(f"{'='*60}")
+        
+        if metrics_logger:
+            metrics_file = metrics_logger.save()
+            print(f"✓ Training metrics saved to: {metrics_file}")
+            
+            # Print final summary
+            if metrics_logger.metrics['epoch_losses']:
+                initial_loss = metrics_logger.metrics['epoch_losses'][0]
+                final_loss = metrics_logger.metrics['epoch_losses'][-1]
+                total_improvement = initial_loss - final_loss
+                improvement_pct = (total_improvement / initial_loss * 100) if initial_loss > 0 else 0
+                
+                print(f"\nFinal Training Summary:")
+                print(f"  Total Epochs:     {len(metrics_logger.metrics['epoch_losses'])}")
+                print(f"  Total Steps:      {len(metrics_logger.metrics['steps'])}")
+                print(f"  Initial Loss:     {initial_loss:.4f}")
+                print(f"  Final Loss:       {final_loss:.4f}")
+                print(f"  Total Improvement: {total_improvement:+.4f} ({improvement_pct:+.2f}%)")
+            
+            # Automatically generate visualization
+            print(f"\n{'='*60}")
+            print("Generating training visualizations...")
+            print(f"{'='*60}")
+            try:
+                import subprocess
+                import sys
+                plot_output_dir = os.path.join(args.save_dir, 'plots')
+                result = subprocess.run(
+                    [sys.executable, 'visualize_training.py', metrics_file, '--output_dir', plot_output_dir],
+                    capture_output=True,
+                    text=True
+                )
+                if result.returncode == 0:
+                    print(f"✓ Visualizations saved to: {plot_output_dir}")
+                    print("\nGenerated plots:")
+                    print(f"  - loss_per_step.png")
+                    print(f"  - loss_per_epoch.png")
+                    print(f"  - loss_smoothed.png")
+                else:
+                    print(f"Warning: Visualization failed. You can run manually:")
+                    print(f"  python visualize_training.py {metrics_file} --output_dir {plot_output_dir}")
+                    if result.stderr:
+                        print(f"  Error: {result.stderr}")
+            except Exception as e:
+                print(f"Warning: Could not generate visualizations automatically: {e}")
+                print(f"You can generate them manually with:")
+                print(f"  python visualize_training.py {metrics_file} --output_dir {os.path.join(args.save_dir, 'plots')}")
+        
+        print(f"\n{'='*60}")
 
 
 def load_yaml_config(config_path):
@@ -548,6 +910,7 @@ def main():
     parser.add_argument('--clip_grad', type=float, default=1.0, help='Gradient clipping')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help='Device')
     parser.add_argument('--save_dir', type=str, default='./checkpoints', help='Checkpoint directory')
+    parser.add_argument('--experiment_name', type=str, default=None, help='Experiment name for metrics logging (default: auto-generated)')
     parser.add_argument('--data_file', type=str, default=None, help='Path to text data file (one sentence per line)')
     
     # HuggingFace dataset arguments
@@ -591,6 +954,7 @@ def main():
     # Distributed training
     parser.add_argument('--world_size', type=int, default=1, help='Number of GPUs for distributed training')
     parser.add_argument('--distributed', action='store_true', help='Use distributed training')
+    parser.add_argument('--master_port', type=str, default=None, help='Master port for distributed training (default: 25419, or from env/--master-port flag)')
     
     args = parser.parse_args()
     
@@ -612,23 +976,30 @@ def main():
     if args.eod_token is None:
         args.eod_token = args.vocab_size - 1
     
-    # Determine world size
-    if args.distributed:
-        world_size = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    # Check if running under torchrun (which sets RANK and WORLD_SIZE)
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        # torchrun is managing the processes - just call main_worker directly
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        main_worker(rank, world_size, args)
     else:
-        world_size = args.world_size
-    
-    if world_size > 1 and torch.cuda.is_available():
-        # Launch distributed training
-        torch.multiprocessing.spawn(
-            main_worker,
-            args=(world_size, args),
-            nprocs=world_size,
-            join=True
-        )
-    else:
-        # Single GPU/CPU training
-        main_worker(0, 1, args)
+        # Determine world size for manual spawn
+        if args.distributed:
+            world_size = torch.cuda.device_count() if torch.cuda.is_available() else 1
+        else:
+            world_size = args.world_size
+        
+        if world_size > 1 and torch.cuda.is_available():
+            # Launch distributed training using spawn
+            torch.multiprocessing.spawn(
+                main_worker,
+                args=(world_size, args),
+                nprocs=world_size,
+                join=True
+            )
+        else:
+            # Single GPU/CPU training
+            main_worker(0, 1, args)
 
 
 if __name__ == '__main__':

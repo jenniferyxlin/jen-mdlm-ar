@@ -3,4 +3,5 @@ numpy
 datasets
 huggingface_hub
 tqdm # installs tqdm progress bar library
-pyyaml 
+pyyaml
+matplotlib 

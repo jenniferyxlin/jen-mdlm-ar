@@ -215,7 +215,15 @@ pip install -r requirements.txt
    python train.py --hf_raw_repo "dataset" --hf_streaming --device cuda
    ```
 
-2. **SSH Access:** Connect to your node via SSH. Prime Intellect typically provides SSH access details in the dashboard.
+2. **SSH Access:** Connect to your node via SSH:
+   ```bash
+   # Quick connect (uses SSH config)
+   ssh prime-intellect-box0
+   
+   # Or manually:
+   ssh -i ~/Documents/Primekeys/private_key.pem -p 25419 root@159.26.81.14
+   ```
+   Your SSH config is already set up, so just run `ssh prime-intellect-box0` to reconnect.
 
 3. **Checkpointing:** The training script saves checkpoints. With 10.84 TB disk, you have ample space for model checkpoints. Make sure you have write permissions in the working directory.
 
