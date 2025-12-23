@@ -216,13 +216,13 @@ class TransformerBlock(nn.Module):
         if attention_mask is not None:
             # Handle different mask formats
             if attention_mask.dim() == 3:
-                # [batch_size, seq_len, seq_len] -> [batch_size, 1, seq_len, seq_len]
-                attention_mask = attention_mask.unsqueeze(1)
+                # [batch_size, seq_len, seq_len] -> [batch_size, 1, seq_len, seq_len] -> [batch_size, n_heads, seq_len, seq_len]
+                attention_mask = attention_mask.unsqueeze(1).repeat(1, self.n_heads, 1, 1)
             elif attention_mask.dim() == 4:
                 # [batch_size, n_heads, seq_len, seq_len] or [batch_size, 1, seq_len, seq_len]
                 # Expand to match number of heads if needed
                 if attention_mask.size(1) == 1:
-                    attention_mask = attention_mask.expand(-1, self.n_heads, -1, -1)
+                    attention_mask = attention_mask.repeat(1, self.n_heads, 1, 1)
                 elif attention_mask.size(1) != self.n_heads:
                     raise ValueError(f"attention_mask has {attention_mask.size(1)} heads but model has {self.n_heads} heads")
             
