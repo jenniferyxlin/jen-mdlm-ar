@@ -331,35 +331,44 @@ def evaluate_mdlm(model, dataloader, device, args, rank=0, use_hf_data=False):
     total_loss = 0
     n_batches = 0
     
-    with torch.no_grad():
-        pbar = tqdm(dataloader, desc="Evaluating", disable=(rank != 0)) if rank == 0 else dataloader
-        for batch in pbar:
-            # Handle HuggingFace data format (x, y) tuples vs simple token tensors
-            if use_hf_data:
-                x, y = batch
-                # Reconstruct full sequence: x is seq[:-1], y is seq[1:], so full seq = [x, last_token_of_y]
-                tokens = torch.cat([x, y[:, -1:]], dim=1).to(device)
-            else:
-                tokens = batch.to(device)
-            
-            # Apply masked diffusion forward process
-            noisy_input, labels, EOD_mask, masked_indices, p_mask, position_ids = get_masked_batch(
-                tokens,
-                eps=args.eps,
-                mask_token_id=model.module.mask_token_id if isinstance(model, DDP) else model.mask_token_id,
-                device=device,
-                eod_token=args.eod_token,
-                mask_schedule=args.mask_schedule
-            )
-            
-            # Forward pass
-            logits = model(noisy_input, position_ids=position_ids)
-            
-            # Compute loss
-            loss = masked_cross_entropy_loss(logits, labels, EOD_mask, masked_indices, p_mask)
-            
-            total_loss += loss.item()
-            n_batches += 1
+    try:
+        with torch.no_grad():
+            pbar = tqdm(dataloader, desc="Evaluating", disable=(rank != 0)) if rank == 0 else dataloader
+            try:
+                for batch in pbar:
+                    # Handle HuggingFace data format (x, y) tuples vs simple token tensors
+                    if use_hf_data:
+                        x, y = batch
+                        # Reconstruct full sequence: x is seq[:-1], y is seq[1:], so full seq = [x, last_token_of_y]
+                        tokens = torch.cat([x, y[:, -1:]], dim=1).to(device)
+                    else:
+                        tokens = batch.to(device)
+                    
+                    # Apply masked diffusion forward process
+                    noisy_input, labels, EOD_mask, masked_indices, p_mask, position_ids = get_masked_batch(
+                        tokens,
+                        eps=args.eps,
+                        mask_token_id=model.module.mask_token_id if isinstance(model, DDP) else model.mask_token_id,
+                        device=device,
+                        eod_token=args.eod_token,
+                        mask_schedule=args.mask_schedule
+                    )
+                    
+                    # Forward pass
+                    logits = model(noisy_input, position_ids=position_ids)
+                    
+                    # Compute loss
+                    loss = masked_cross_entropy_loss(logits, labels, EOD_mask, masked_indices, p_mask)
+                    
+                    total_loss += loss.item()
+                    n_batches += 1
+            finally:
+                # Explicitly close progress bar to release resources
+                if rank == 0 and hasattr(pbar, 'close'):
+                    pbar.close()
+    finally:
+        # Ensure model is back in train mode
+        model.train()
     
     if n_batches == 0:
         if rank == 0:
@@ -375,33 +384,42 @@ def evaluate_ar(model, dataloader, device, args, rank=0, use_hf_data=False):
     total_loss = 0
     n_batches = 0
     
-    with torch.no_grad():
-        pbar = tqdm(dataloader, desc="Evaluating", disable=(rank != 0)) if rank == 0 else dataloader
-        for batch in pbar:
-            # Handle HuggingFace data format (x, y) tuples vs simple token tensors
-            if use_hf_data:
-                x, y = batch
-                # For AR: x is input, y is target (already shifted)
-                tokens = torch.cat([x, y[:, -1:]], dim=1).to(device)
-            else:
-                tokens = batch.to(device)
-            
-            # Prepare AR batch (no random masking during evaluation)
-            input_ids, labels, loss_mask, attention_mask, position_ids = get_ar_batch(
-                tokens,
-                eod_token=args.eod_token,
-                eod_mask_loss=True,
-                randmask_ratio=0.0  # No random masking during evaluation
-            )
-            
-            # Forward pass
-            logits = model(input_ids, position_ids=position_ids, attention_mask=attention_mask)
-            
-            # Compute loss
-            loss = ar_cross_entropy_loss(logits, labels, loss_mask)
-            
-            total_loss += loss.item()
-            n_batches += 1
+    try:
+        with torch.no_grad():
+            pbar = tqdm(dataloader, desc="Evaluating", disable=(rank != 0)) if rank == 0 else dataloader
+            try:
+                for batch in pbar:
+                    # Handle HuggingFace data format (x, y) tuples vs simple token tensors
+                    if use_hf_data:
+                        x, y = batch
+                        # For AR: x is input, y is target (already shifted)
+                        tokens = torch.cat([x, y[:, -1:]], dim=1).to(device)
+                    else:
+                        tokens = batch.to(device)
+                    
+                    # Prepare AR batch (no random masking during evaluation)
+                    input_ids, labels, loss_mask, attention_mask, position_ids = get_ar_batch(
+                        tokens,
+                        eod_token=args.eod_token,
+                        eod_mask_loss=True,
+                        randmask_ratio=0.0  # No random masking during evaluation
+                    )
+                    
+                    # Forward pass
+                    logits = model(input_ids, position_ids=position_ids, attention_mask=attention_mask)
+                    
+                    # Compute loss
+                    loss = ar_cross_entropy_loss(logits, labels, loss_mask)
+                    
+                    total_loss += loss.item()
+                    n_batches += 1
+            finally:
+                # Explicitly close progress bar to release resources
+                if rank == 0 and hasattr(pbar, 'close'):
+                    pbar.close()
+    finally:
+        # Ensure model is back in train mode
+        model.train()
     
     if n_batches == 0:
         if rank == 0:
@@ -996,52 +1014,60 @@ def main_worker(rank, world_size, args):
                 print(f"  Improvement:  {improvement:+.4f} ({improvement_pct:+.2f}%)")
             
             # Run validation evaluation if validation dataloader is available
-            # Only evaluate on rank 0 to avoid synchronization issues
+            # CRITICAL: Only evaluate on rank 0 to avoid dataloader blocking issues
             validation_loss = None
             
-            # Synchronize all ranks before validation to ensure everyone is ready
+            # Synchronize all ranks before validation
             if world_size > 1:
                 dist.barrier()
             
-            if val_dataloader is not None:
-                if rank == 0:
-                    print(f"\n  Running validation evaluation...")
-                    try:
-                        if model_type == 'ar':
-                            validation_loss = evaluate_ar(model, val_dataloader, device, args, rank, use_hf_data=use_hf_data)
-                        else:
-                            validation_loss = evaluate_mdlm(model, val_dataloader, device, args, rank, use_hf_data=use_hf_data)
-                        
-                        # Check for valid loss value
-                        if validation_loss is None or (isinstance(validation_loss, float) and (validation_loss != validation_loss or validation_loss == float('inf'))):
-                            print(f"  Warning: Invalid validation loss: {validation_loss}, skipping validation")
-                            validation_loss = None
-                        else:
-                            print(f"  Validation Loss: {validation_loss:.4f}")
-                    except Exception as e:
-                        print(f"  Error during validation evaluation: {e}")
-                        validation_loss = None
-                    finally:
-                        # Ensure model is back in train mode after evaluation
-                        model.train()
-                
-                # Broadcast validation loss from rank 0 to all ranks
-                if world_size > 1:
-                    if rank == 0:
-                        # Use a sentinel value if validation failed
-                        if validation_loss is None:
-                            validation_loss = float('inf')
-                        validation_loss_tensor = torch.tensor(validation_loss, device=device)
+            # Only rank 0 evaluates - other ranks skip entirely to avoid dataloader issues
+            if rank == 0 and val_dataloader is not None:
+                print(f"\n  Running validation evaluation...")
+                try:
+                    if model_type == 'ar':
+                        validation_loss = evaluate_ar(model, val_dataloader, device, args, rank, use_hf_data=use_hf_data)
                     else:
-                        validation_loss_tensor = torch.tensor(0.0, device=device)
-                    dist.broadcast(validation_loss_tensor, src=0)
-                    validation_loss = validation_loss_tensor.item()
-                    # Convert sentinel value back to None
-                    if validation_loss == float('inf'):
+                        validation_loss = evaluate_mdlm(model, val_dataloader, device, args, rank, use_hf_data=use_hf_data)
+                    
+                    # Check for valid loss value
+                    if validation_loss is None or (isinstance(validation_loss, float) and (validation_loss != validation_loss or validation_loss == float('inf'))):
+                        print(f"  Warning: Invalid validation loss: {validation_loss}, skipping validation")
                         validation_loss = None
+                    else:
+                        print(f"  Validation Loss: {validation_loss:.4f}")
+                except Exception as e:
+                    print(f"  Error during validation evaluation: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    validation_loss = None
+                # Note: evaluate_* functions already set model.train() in their finally blocks
             
-            # Synchronize all processes after validation (ALL ranks must participate)
-            # This barrier is critical - ALL ranks must reach it, regardless of val_dataloader
+            # Broadcast validation loss from rank 0 to all ranks
+            # This MUST happen for all ranks to synchronize
+            if world_size > 1:
+                # Prepare tensor on all ranks
+                if rank == 0:
+                    # Use a sentinel value if validation failed or wasn't run
+                    if validation_loss is None:
+                        validation_loss = float('inf')
+                    validation_loss_tensor = torch.tensor(validation_loss, device=device, dtype=torch.float32)
+                else:
+                    # Other ranks create a placeholder tensor
+                    validation_loss_tensor = torch.tensor(0.0, device=device, dtype=torch.float32)
+                
+                # Broadcast from rank 0 to all ranks - ALL ranks must participate
+                dist.broadcast(validation_loss_tensor, src=0)
+                
+                # Extract the value
+                validation_loss = validation_loss_tensor.item()
+                # Convert sentinel value back to None
+                if validation_loss == float('inf'):
+                    validation_loss = None
+            
+            # CRITICAL: Synchronize ALL processes after validation
+            # This barrier MUST be reached by ALL ranks, no exceptions
+            # It's outside all conditionals to ensure every rank participates
             if world_size > 1:
                 dist.barrier()
             
