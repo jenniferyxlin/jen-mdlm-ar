@@ -16,8 +16,10 @@ import json
 import time
 from datetime import datetime
 
-from model import MDLModel
+from mdlm import MDLModel
+from arm import ARModel
 from diffusion import get_masked_batch, masked_cross_entropy_loss
+from ar import get_ar_batch, ar_cross_entropy_loss
 from data import get_dataloader
 
 
@@ -180,8 +182,8 @@ def load_hf_dataset(hf_raw_repo, config_name, split_to_use, rank, streaming=Fals
         return train_ds
 
 
-def train_epoch(model, dataloader, optimizer, device, args, rank=0, use_hf_data=False, metrics_logger=None, epoch_num=0):
-    """Train for one epoch."""
+def train_epoch_mdlm(model, dataloader, optimizer, device, args, rank=0, use_hf_data=False, metrics_logger=None, epoch_num=0):
+    """Train MDLM for one epoch."""
     model.train()
     total_loss = 0
     n_batches = 0
@@ -250,8 +252,80 @@ def train_epoch(model, dataloader, optimizer, device, args, rank=0, use_hf_data=
     return avg_loss, step_losses
 
 
-def evaluate(model, dataloader, device, args, rank=0, use_hf_data=False):
-    """Evaluate model."""
+def train_epoch_ar(model, dataloader, optimizer, device, args, rank=0, use_hf_data=False, metrics_logger=None, epoch_num=0):
+    """Train AR model for one epoch."""
+    model.train()
+    total_loss = 0
+    n_batches = 0
+    step_losses = []  # Track losses per step for visualization
+    running_avg_window = 100  # Window for running average
+    recent_losses = []  # Track recent losses for running average
+    
+    # Use tqdm only on rank 0
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch_num+1}", disable=(rank != 0)) if rank == 0 else dataloader
+    
+    for step, batch in enumerate(pbar):
+        # Handle HuggingFace data format (x, y) tuples vs simple token tensors
+        if use_hf_data:
+            x, y = batch
+            # For AR: x is input, y is target (already shifted)
+            # We need full sequence: [x, last_token_of_y] to create input/target pairs
+            tokens = torch.cat([x, y[:, -1:]], dim=1).to(device)
+        else:
+            tokens = batch.to(device)
+        
+        # Prepare AR batch (shifts tokens and creates masks)
+        randmask_ratio = getattr(args, 'randmask_ratio', 0.0)
+        eps = getattr(args, 'eps', 1e-3)
+        input_ids, labels, loss_mask, attention_mask, position_ids = get_ar_batch(
+            tokens,
+            eod_token=args.eod_token,
+            eod_mask_loss=True,
+            randmask_ratio=randmask_ratio,
+            eps=eps
+        )
+        
+        # Forward pass
+        logits = model(input_ids, position_ids=position_ids, attention_mask=attention_mask)
+        
+        # Compute loss
+        loss = ar_cross_entropy_loss(logits, labels, loss_mask)
+        
+        # Backward pass
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
+        optimizer.step()
+        
+        loss_value = loss.item()
+        total_loss += loss_value
+        n_batches += 1
+        step_losses.append(loss_value)
+        
+        # Track running average
+        recent_losses.append(loss_value)
+        if len(recent_losses) > running_avg_window:
+            recent_losses.pop(0)
+        running_avg = sum(recent_losses) / len(recent_losses) if recent_losses else loss_value
+        
+        # Log step-level metrics
+        if metrics_logger is not None and rank == 0:
+            metrics_logger.log_step(step, loss_value, total_loss / n_batches)
+        
+        # Update progress bar with enhanced loss info
+        if rank == 0:
+            pbar.set_postfix({
+                'loss': f'{loss_value:.4f}',
+                'avg': f'{total_loss / n_batches:.4f}',
+                'run_avg': f'{running_avg:.4f}'
+            })
+    
+    avg_loss = total_loss / n_batches
+    return avg_loss, step_losses
+
+
+def evaluate_mdlm(model, dataloader, device, args, rank=0, use_hf_data=False):
+    """Evaluate MDLM model."""
     model.eval()
     total_loss = 0
     n_batches = 0
@@ -282,6 +356,43 @@ def evaluate(model, dataloader, device, args, rank=0, use_hf_data=False):
             
             # Compute loss
             loss = masked_cross_entropy_loss(logits, labels, EOD_mask, masked_indices, p_mask)
+            
+            total_loss += loss.item()
+            n_batches += 1
+    
+    return total_loss / n_batches
+
+
+def evaluate_ar(model, dataloader, device, args, rank=0, use_hf_data=False):
+    """Evaluate AR model."""
+    model.eval()
+    total_loss = 0
+    n_batches = 0
+    
+    with torch.no_grad():
+        pbar = tqdm(dataloader, desc="Evaluating", disable=(rank != 0)) if rank == 0 else dataloader
+        for batch in pbar:
+            # Handle HuggingFace data format (x, y) tuples vs simple token tensors
+            if use_hf_data:
+                x, y = batch
+                # For AR: x is input, y is target (already shifted)
+                tokens = torch.cat([x, y[:, -1:]], dim=1).to(device)
+            else:
+                tokens = batch.to(device)
+            
+            # Prepare AR batch (no random masking during evaluation)
+            input_ids, labels, loss_mask, attention_mask, position_ids = get_ar_batch(
+                tokens,
+                eod_token=args.eod_token,
+                eod_mask_loss=True,
+                randmask_ratio=0.0  # No random masking during evaluation
+            )
+            
+            # Forward pass
+            logits = model(input_ids, position_ids=position_ids, attention_mask=attention_mask)
+            
+            # Compute loss
+            loss = ar_cross_entropy_loss(logits, labels, loss_mask)
             
             total_loss += loss.item()
             n_batches += 1
@@ -349,19 +460,41 @@ def main_worker(rank, world_size, args):
     else:
         device = torch.device(args.device)
     
-    # Create model
-    model = MDLModel(
-        vocab_size=args.vocab_size,
-        d_model=args.d_model,
-        n_layers=args.n_layers,
-        n_heads=args.n_heads,
-        d_ff=args.d_ff,
-        max_seq_len=args.max_seq_len,
-        dropout=args.dropout,
-        use_rope=args.use_rope,
-        rope_theta=args.rope_theta,
-        rope_percent=args.rope_percent
-    ).to(device)
+    # Determine model type
+    model_type = getattr(args, 'model_type', 'mdlm').lower()
+    if model_type not in ['mdlm', 'ar']:
+        if rank == 0:
+            print(f"Warning: Unknown model_type '{model_type}', defaulting to 'mdlm'")
+        model_type = 'mdlm'
+    
+    # Create model based on type
+    if model_type == 'ar':
+        model = ARModel(
+            vocab_size=args.vocab_size,
+            d_model=args.d_model,
+            n_layers=args.n_layers,
+            n_heads=args.n_heads,
+            d_ff=args.d_ff,
+            max_seq_len=args.max_seq_len,
+            dropout=args.dropout,
+            eod_token_id=args.eod_token,
+            use_rope=args.use_rope,
+            rope_theta=args.rope_theta,
+            rope_percent=args.rope_percent
+        ).to(device)
+    else:  # mdlm
+        model = MDLModel(
+            vocab_size=args.vocab_size,
+            d_model=args.d_model,
+            n_layers=args.n_layers,
+            n_heads=args.n_heads,
+            d_ff=args.d_ff,
+            max_seq_len=args.max_seq_len,
+            dropout=args.dropout,
+            use_rope=args.use_rope,
+            rope_theta=args.rope_theta,
+            rope_percent=args.rope_percent
+        ).to(device)
     
     # Wrap with DDP if distributed
     if world_size > 1:
@@ -571,8 +704,9 @@ def main_worker(rank, world_size, args):
     # Initialize metrics logger (only on rank 0)
     metrics_logger = None
     if rank == 0:
-        experiment_name = args.experiment_name or f"mdlm_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        metrics_logger = MetricsLogger(args.save_dir, model_type="MDLM", experiment_name=experiment_name)
+        model_type_str = model_type.upper()
+        experiment_name = args.experiment_name or f"{model_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        metrics_logger = MetricsLogger(args.save_dir, model_type=model_type_str, experiment_name=experiment_name)
     
     # Training loop
     if rank == 0:
@@ -607,7 +741,11 @@ def main_worker(rank, world_size, args):
             print(f"Epoch {epoch + 1}/{args.epochs}")
             print(f"{'='*60}")
         
-        train_loss, step_losses = train_epoch(model, dataloader, optimizer, device, args, rank, use_hf_data=use_hf_data, metrics_logger=metrics_logger, epoch_num=epoch)
+        # Use appropriate training function based on model type
+        if model_type == 'ar':
+            train_loss, step_losses = train_epoch_ar(model, dataloader, optimizer, device, args, rank, use_hf_data=use_hf_data, metrics_logger=metrics_logger, epoch_num=epoch)
+        else:
+            train_loss, step_losses = train_epoch_mdlm(model, dataloader, optimizer, device, args, rank, use_hf_data=use_hf_data, metrics_logger=metrics_logger, epoch_num=epoch)
         
         if rank == 0:
             # Calculate additional statistics
@@ -670,14 +808,18 @@ def main_worker(rank, world_size, args):
                 print(f"  Final Loss:       {final_loss:.4f}")
                 print(f"  Total Improvement: {total_improvement:+.4f} ({improvement_pct:+.2f}%)")
             
-            # Automatically generate visualization
+            # Automatically generate visualization for individual run
             print(f"\n{'='*60}")
             print("Generating training visualizations...")
             print(f"{'='*60}")
             try:
                 import subprocess
                 import sys
-                plot_output_dir = os.path.join(args.save_dir, 'plots')
+                # Create unique output directory for this run's plots
+                # Use experiment name to create a subdirectory
+                plot_output_dir = os.path.join(args.save_dir, 'plots', metrics_logger.experiment_name)
+                os.makedirs(plot_output_dir, exist_ok=True)
+                # Don't use --compare_epochs for individual runs (only for combined comparison)
                 result = subprocess.run(
                     [sys.executable, 'visualize_training.py', metrics_file, '--output_dir', plot_output_dir],
                     capture_output=True,
@@ -697,7 +839,7 @@ def main_worker(rank, world_size, args):
             except Exception as e:
                 print(f"Warning: Could not generate visualizations automatically: {e}")
                 print(f"You can generate them manually with:")
-                print(f"  python visualize_training.py {metrics_file} --output_dir {os.path.join(args.save_dir, 'plots')}")
+                print(f"  python visualize_training.py {metrics_file} --output_dir {os.path.join(args.save_dir, 'plots', metrics_logger.experiment_name)}")
         
         print(f"\n{'='*60}")
 
@@ -747,9 +889,11 @@ def apply_yaml_config(args, yaml_config):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train Enhanced MDM')
+    parser = argparse.ArgumentParser(description='Train MDLM or AR model')
     parser.add_argument('--config', type=str, default=None,
                         help='Path to YAML configuration file (e.g., default.yaml)')
+    parser.add_argument('--model_type', type=str, default='mdlm', choices=['mdlm', 'ar'],
+                        help='Model type: "mdlm" for Masked Diffusion Language Model or "ar" for Autoregressive (default: mdlm)')
     parser.add_argument('--vocab_size', type=int, default=50257, help='Vocabulary size')
     parser.add_argument('--d_model', type=int, default=512, help='Model dimension')
     parser.add_argument('--n_layers', type=int, default=6, help='Number of layers')
@@ -760,6 +904,8 @@ def main():
     parser.add_argument('--eps', type=float, default=1e-3, help='Minimum mask probability')
     parser.add_argument('--mask_schedule', type=str, default='linear', choices=['linear', 'cosine'], 
                         help='Masking schedule: linear or cosine (default: linear)')
+    parser.add_argument('--randmask_ratio', type=float, default=0.0,
+                        help='Probability of applying random masking to attention during AR training (0.0 = no random masking, similar to Megatron)')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--epochs', type=int, default=10, help='Number of epochs')
