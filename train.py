@@ -726,39 +726,66 @@ def main_worker(rank, world_size, args):
                         continue
                 
                 if epoch_numbers:
-                    latest_epoch = max(epoch_numbers)
-                    checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{latest_epoch}.pt')
+                    # Try checkpoints from newest to oldest until we find a valid one
+                    epoch_numbers.sort(reverse=True)
+                    checkpoint_loaded = False
                     
-                    if os.path.exists(checkpoint_path):
-                        print(f"\n{'='*60}")
-                        print(f"Found checkpoint: {checkpoint_path}")
-                        print(f"Resuming from epoch {latest_epoch + 1}/{args.epochs}")
-                        print(f"{'='*60}\n")
+                    for epoch_num in epoch_numbers:
+                        checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch_num}.pt')
                         
-                        # Load checkpoint
-                        checkpoint = torch.load(checkpoint_path, map_location=device)
-                        start_epoch = checkpoint['epoch'] + 1  # Start from next epoch
+                        if not os.path.exists(checkpoint_path):
+                            continue
                         
-                        # Load model state
-                        if isinstance(model, DDP):
-                            model.module.load_state_dict(checkpoint['model_state_dict'])
-                        else:
-                            model.load_state_dict(checkpoint['model_state_dict'])
-                        
-                        # Load optimizer state
-                        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                        
-                        # Load metrics if available
-                        metrics_file = os.path.join(checkpoint_dir, f'{experiment_name}_metrics.json')
-                        if os.path.exists(metrics_file):
-                            with open(metrics_file, 'r') as f:
-                                saved_metrics = json.load(f)
-                                metrics_logger.metrics = saved_metrics
-                                metrics_logger.current_epoch = start_epoch - 1
-                                metrics_logger.global_step = len(saved_metrics.get('steps', []))
-                                print(f"Loaded metrics from: {metrics_file}")
-                        
-                        print(f"Resuming training from epoch {start_epoch + 1}/{args.epochs}\n")
+                        try:
+                            # Try to load checkpoint
+                            checkpoint = torch.load(checkpoint_path, map_location=device)
+                            
+                            # Verify checkpoint has required keys
+                            if 'epoch' not in checkpoint or 'model_state_dict' not in checkpoint:
+                                print(f"Warning: Checkpoint {checkpoint_path} is missing required keys, skipping...")
+                                continue
+                            
+                            print(f"\n{'='*60}")
+                            print(f"Found valid checkpoint: {checkpoint_path}")
+                            print(f"Resuming from epoch {epoch_num + 1}/{args.epochs}")
+                            print(f"{'='*60}\n")
+                            
+                            start_epoch = checkpoint['epoch'] + 1  # Start from next epoch
+                            
+                            # Load model state
+                            if isinstance(model, DDP):
+                                model.module.load_state_dict(checkpoint['model_state_dict'])
+                            else:
+                                model.load_state_dict(checkpoint['model_state_dict'])
+                            
+                            # Load optimizer state if available
+                            if 'optimizer_state_dict' in checkpoint:
+                                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                            
+                            # Load metrics if available
+                            metrics_file = os.path.join(checkpoint_dir, f'{experiment_name}_metrics.json')
+                            if os.path.exists(metrics_file):
+                                try:
+                                    with open(metrics_file, 'r') as f:
+                                        saved_metrics = json.load(f)
+                                        metrics_logger.metrics = saved_metrics
+                                        metrics_logger.current_epoch = start_epoch - 1
+                                        metrics_logger.global_step = len(saved_metrics.get('steps', []))
+                                        print(f"Loaded metrics from: {metrics_file}")
+                                except Exception as e:
+                                    print(f"Warning: Could not load metrics from {metrics_file}: {e}")
+                            
+                            print(f"Resuming training from epoch {start_epoch + 1}/{args.epochs}\n")
+                            checkpoint_loaded = True
+                            break
+                            
+                        except Exception as e:
+                            print(f"Warning: Checkpoint {checkpoint_path} is corrupted or invalid: {e}")
+                            print(f"Trying next checkpoint...")
+                            continue
+                    
+                    if not checkpoint_loaded:
+                        print("Warning: No valid checkpoints found, starting from scratch")
     
     # Broadcast start_epoch to all ranks
     if world_size > 1:
