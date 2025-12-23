@@ -998,6 +998,11 @@ def main_worker(rank, world_size, args):
             # Run validation evaluation if validation dataloader is available
             # Only evaluate on rank 0 to avoid synchronization issues
             validation_loss = None
+            
+            # Synchronize all ranks before validation to ensure everyone is ready
+            if world_size > 1:
+                dist.barrier()
+            
             if val_dataloader is not None:
                 if rank == 0:
                     print(f"\n  Running validation evaluation...")
@@ -1016,6 +1021,9 @@ def main_worker(rank, world_size, args):
                     except Exception as e:
                         print(f"  Error during validation evaluation: {e}")
                         validation_loss = None
+                    finally:
+                        # Ensure model is back in train mode after evaluation
+                        model.train()
                 
                 # Broadcast validation loss from rank 0 to all ranks
                 if world_size > 1:
@@ -1031,8 +1039,11 @@ def main_worker(rank, world_size, args):
                     # Convert sentinel value back to None
                     if validation_loss == float('inf'):
                         validation_loss = None
-                    # Synchronize all processes after validation
-                    dist.barrier()
+            
+            # Synchronize all processes after validation (ALL ranks must participate)
+            # This barrier is critical - ALL ranks must reach it, regardless of val_dataloader
+            if world_size > 1:
+                dist.barrier()
             
             # Log epoch metrics
             if metrics_logger:
