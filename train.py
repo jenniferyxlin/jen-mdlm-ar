@@ -361,6 +361,11 @@ def evaluate_mdlm(model, dataloader, device, args, rank=0, use_hf_data=False):
             total_loss += loss.item()
             n_batches += 1
     
+    if n_batches == 0:
+        if rank == 0:
+            print("  Warning: Validation dataloader is empty!")
+        return float('inf')  # Return a sentinel value
+    
     return total_loss / n_batches
 
 
@@ -397,6 +402,11 @@ def evaluate_ar(model, dataloader, device, args, rank=0, use_hf_data=False):
             
             total_loss += loss.item()
             n_batches += 1
+    
+    if n_batches == 0:
+        if rank == 0:
+            print("  Warning: Validation dataloader is empty!")
+        return float('inf')  # Return a sentinel value
     
     return total_loss / n_batches
 
@@ -986,25 +996,43 @@ def main_worker(rank, world_size, args):
                 print(f"  Improvement:  {improvement:+.4f} ({improvement_pct:+.2f}%)")
             
             # Run validation evaluation if validation dataloader is available
+            # Only evaluate on rank 0 to avoid synchronization issues
             validation_loss = None
             if val_dataloader is not None:
                 if rank == 0:
                     print(f"\n  Running validation evaluation...")
-                if model_type == 'ar':
-                    validation_loss = evaluate_ar(model, val_dataloader, device, args, rank, use_hf_data=use_hf_data)
-                else:
-                    validation_loss = evaluate_mdlm(model, val_dataloader, device, args, rank, use_hf_data=use_hf_data)
+                    try:
+                        if model_type == 'ar':
+                            validation_loss = evaluate_ar(model, val_dataloader, device, args, rank, use_hf_data=use_hf_data)
+                        else:
+                            validation_loss = evaluate_mdlm(model, val_dataloader, device, args, rank, use_hf_data=use_hf_data)
+                        
+                        # Check for valid loss value
+                        if validation_loss is None or (isinstance(validation_loss, float) and (validation_loss != validation_loss or validation_loss == float('inf'))):
+                            print(f"  Warning: Invalid validation loss: {validation_loss}, skipping validation")
+                            validation_loss = None
+                        else:
+                            print(f"  Validation Loss: {validation_loss:.4f}")
+                    except Exception as e:
+                        print(f"  Error during validation evaluation: {e}")
+                        validation_loss = None
                 
-                # Aggregate validation loss across all ranks
+                # Broadcast validation loss from rank 0 to all ranks
                 if world_size > 1:
-                    validation_loss_tensor = torch.tensor(validation_loss, device=device)
-                    dist.all_reduce(validation_loss_tensor, op=dist.ReduceOp.SUM)
-                    validation_loss = validation_loss_tensor.item() / world_size
+                    if rank == 0:
+                        # Use a sentinel value if validation failed
+                        if validation_loss is None:
+                            validation_loss = float('inf')
+                        validation_loss_tensor = torch.tensor(validation_loss, device=device)
+                    else:
+                        validation_loss_tensor = torch.tensor(0.0, device=device)
+                    dist.broadcast(validation_loss_tensor, src=0)
+                    validation_loss = validation_loss_tensor.item()
+                    # Convert sentinel value back to None
+                    if validation_loss == float('inf'):
+                        validation_loss = None
                     # Synchronize all processes after validation
                     dist.barrier()
-                
-                if rank == 0:
-                    print(f"  Validation Loss: {validation_loss:.4f}")
             
             # Log epoch metrics
             if metrics_logger:
