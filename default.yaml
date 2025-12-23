@@ -1,0 +1,6 @@
+# Pretokenized dataset from HuggingFace Hub
+hf_repo: "flappingairplanes/fineweb-edu-sample-10bt_gpt2"
+tokenizer: "gpt2"  # Must match tokenizer used for pretokenization
+max_tokens: null  # null = use all tokens, or set e.g. 1_000_000_000 for 1B
+subset: null  # null = root of repo, or specific folder name
+version: null  # null = latest, or set e.g. "v1" for specific version
