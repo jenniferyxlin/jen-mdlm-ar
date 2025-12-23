@@ -4,7 +4,7 @@ Training script for MDLM with distributed training support
 
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, IterableDataset
 from torch.nn.parallel import DistributedDataParallel as DDP
 import argparse
 from tqdm import tqdm
@@ -13,6 +13,7 @@ import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
 import yaml
 import json
+import time
 from datetime import datetime
 
 from model import MDLModel
@@ -105,10 +106,8 @@ def setup_distributed(rank, world_size, backend='nccl', master_port=None):
     if 'MASTER_ADDR' not in os.environ:
         os.environ['MASTER_ADDR'] = 'localhost'
     
-    # MASTER_PORT priority: function arg > environment variable > default
     # If master_port is explicitly provided, use it (overrides environment)
     # Otherwise, use environment if set, or default to 25419
-    # Special case: if torchrun set it to 12355 (default) but we want 25419, override it
     target_port = None
     if master_port:
         target_port = str(master_port)
@@ -122,7 +121,7 @@ def setup_distributed(rank, world_size, backend='nccl', master_port=None):
     else:
         target_port = '25419'  # Default
     
-    # Set the port - CRITICAL: must be set before init_process_group
+    # Set the port 
     os.environ['MASTER_PORT'] = target_port
     
     # Double-check it's set correctly (sometimes torchrun overrides it)
@@ -151,6 +150,34 @@ def setup_distributed(rank, world_size, backend='nccl', master_port=None):
 def cleanup_distributed():
     """Clean up distributed training."""
     dist.destroy_process_group()
+
+
+def load_hf_dataset(hf_raw_repo, config_name, split_to_use, rank, streaming=False):
+    """Helper function to load HuggingFace dataset with proper rank handling."""
+    from datasets import load_dataset
+    
+    if streaming:
+        if config_name:
+            return load_dataset(hf_raw_repo, config_name, streaming=True, split=split_to_use)
+        else:
+            return load_dataset(hf_raw_repo, streaming=True, split=split_to_use)
+    else:
+        # Load dataset (only on rank 0 to avoid multiple downloads)
+        if rank == 0:
+            if config_name:
+                hf_dataset = load_dataset(hf_raw_repo, config_name)
+            else:
+                hf_dataset = load_dataset(hf_raw_repo)
+            train_ds = hf_dataset[split_to_use] if isinstance(hf_dataset, dict) and split_to_use in hf_dataset else hf_dataset
+        else:
+            # Other ranks wait a bit then load
+            time.sleep(1)
+            if config_name:
+                hf_dataset = load_dataset(hf_raw_repo, config_name)
+            else:
+                hf_dataset = load_dataset(hf_raw_repo)
+            train_ds = hf_dataset[split_to_use] if isinstance(hf_dataset, dict) and split_to_use in hf_dataset else hf_dataset
+        return train_ds
 
 
 def train_epoch(model, dataloader, optimizer, device, args, rank=0, use_hf_data=False, metrics_logger=None, epoch_num=0):
@@ -381,31 +408,13 @@ def main_worker(rank, world_size, args):
             print(f"  Block size: {args.hf_block_size}")
         
         # Load dataset (with streaming support)
-        # If hf_raw_split is provided, use it as config name; otherwise load without config
-        if args.hf_streaming:
-            if config_name:
-                ds = load_dataset(args.hf_raw_repo, config_name, streaming=True, split=split_to_use)
-            else:
-                ds = load_dataset(args.hf_raw_repo, streaming=True, split=split_to_use)
-            train_ds = ds
-        else:
-            # Load dataset (only on rank 0 to avoid multiple downloads)
-            if rank == 0:
-                if config_name:
-                    hf_dataset = load_dataset(args.hf_raw_repo, config_name)
-                else:
-                    hf_dataset = load_dataset(args.hf_raw_repo)
-                # Get the requested split
-                train_ds = hf_dataset[split_to_use] if isinstance(hf_dataset, dict) and split_to_use in hf_dataset else hf_dataset
-            else:
-                # Other ranks wait a bit then load
-                import time
-                time.sleep(1)
-                if config_name:
-                    hf_dataset = load_dataset(args.hf_raw_repo, config_name)
-                else:
-                    hf_dataset = load_dataset(args.hf_raw_repo)
-                train_ds = hf_dataset[split_to_use] if isinstance(hf_dataset, dict) and split_to_use in hf_dataset else hf_dataset
+        train_ds = load_hf_dataset(
+            args.hf_raw_repo, 
+            config_name, 
+            split_to_use, 
+            rank, 
+            streaming=args.hf_streaming
+        )
         
         # Load tokenizer
         tokenizer = AutoTokenizer.from_pretrained(args.hf_tokenizer)
@@ -466,8 +475,6 @@ def main_worker(rank, world_size, args):
         
         # For streaming datasets, we need to use IterableDataset
         if args.hf_streaming:
-            from torch.utils.data import IterableDataset
-            
             # Convert to IterableDataset for streaming
             # Note: streaming datasets can't use DistributedSampler easily
             class StreamingDatasetWrapper(IterableDataset):
@@ -527,157 +534,6 @@ def main_worker(rank, world_size, args):
             replicate_shards=args.hf_replicate_shards,
             num_workers=args.num_workers,
         )
-    elif use_hf_raw:
-        # Use raw HuggingFace dataset with proper preprocessing pipeline
-        from datasets import load_dataset
-        from transformers import AutoTokenizer
-        
-        # hf_raw_split can be a config name (e.g., "wikitext-2-v1") or None
-        config_name = args.hf_raw_split
-        # hf_split is the actual split to use (train, test, validation)
-        split_to_use = args.hf_split
-        
-        if rank == 0:
-            print(f"Loading raw dataset from HuggingFace: {args.hf_raw_repo}")
-            if config_name:
-                print(f"  Config: {config_name}")
-            print(f"  Split: {split_to_use}")
-            print(f"  Streaming: {args.hf_streaming}")
-            print(f"  Tokenizer: {args.hf_tokenizer}")
-            print(f"  Text column: {args.hf_text_column}")
-        
-        # Set default block_size to max_seq_len if not provided
-        if args.hf_block_size is None:
-            args.hf_block_size = args.max_seq_len
-        
-        if rank == 0:
-            print(f"  Block size: {args.hf_block_size}")
-        
-        # Load dataset (with streaming support)
-        # If hf_raw_split is provided, use it as config name; otherwise load without config
-        if args.hf_streaming:
-            if config_name:
-                ds = load_dataset(args.hf_raw_repo, config_name, streaming=True, split=split_to_use)
-            else:
-                ds = load_dataset(args.hf_raw_repo, streaming=True, split=split_to_use)
-            train_ds = ds
-        else:
-            # Load dataset (only on rank 0 to avoid multiple downloads)
-            if rank == 0:
-                if config_name:
-                    hf_dataset = load_dataset(args.hf_raw_repo, config_name)
-                else:
-                    hf_dataset = load_dataset(args.hf_raw_repo)
-                # Get the requested split
-                train_ds = hf_dataset[split_to_use] if isinstance(hf_dataset, dict) and split_to_use in hf_dataset else hf_dataset
-            else:
-                # Other ranks wait a bit then load
-                import time
-                time.sleep(1)
-                if config_name:
-                    hf_dataset = load_dataset(args.hf_raw_repo, config_name)
-                else:
-                    hf_dataset = load_dataset(args.hf_raw_repo)
-                train_ds = hf_dataset[split_to_use] if isinstance(hf_dataset, dict) and split_to_use in hf_dataset else hf_dataset
-        
-        # Load tokenizer
-        tokenizer = AutoTokenizer.from_pretrained(args.hf_tokenizer)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        
-        # Update vocab_size from tokenizer if needed
-        if args.vocab_size == 50257:  # Default value
-            args.vocab_size = len(tokenizer)
-            if rank == 0:
-                print(f"  Using vocab_size from tokenizer: {args.vocab_size}")
-        
-        # Set EOD token from tokenizer
-        if args.eod_token is None or args.eod_token == args.vocab_size - 1:
-            args.eod_token = tokenizer.eos_token_id or args.vocab_size - 1
-        
-        # Preprocessing pipeline
-        if rank == 0:
-            print("  Preprocessing dataset: filtering empty rows...")
-        
-        # Step 1: Filter empty/newline-only rows
-        filtered_ds = train_ds.filter(
-            lambda x: bool(x[args.hf_text_column] and x[args.hf_text_column].strip())
-        )
-        
-        if rank == 0:
-            print("  Tokenizing dataset (batched)...")
-        
-        # Step 2: Tokenize in batches
-        def tokenize(batch):
-            """Tokenize text batches."""
-            return tokenizer(batch[args.hf_text_column], return_attention_mask=False)
-        
-        tokenized = filtered_ds.map(
-            tokenize,
-            batched=True,
-            remove_columns=[col for col in filtered_ds.column_names if col != "input_ids"]
-        )
-        
-        if rank == 0:
-            print(f"  Chunking sequences into blocks of size {args.hf_block_size}...")
-        
-        # Step 3: Chunk sequences into fixed-size blocks
-        block_size = args.hf_block_size
-        
-        def chunk(batch):
-            """Concatenate and chunk sequences."""
-            concatenated = sum(batch["input_ids"], [])
-            total_len = (len(concatenated) // block_size) * block_size
-            return {
-                "input_ids": [
-                    concatenated[i : i + block_size]
-                    for i in range(0, total_len, block_size)
-                ]
-            }
-        
-        processed_ds = tokenized.map(chunk, batched=True)
-        
-        # For streaming datasets, we need to use IterableDataset
-        if args.hf_streaming:
-            from torch.utils.data import IterableDataset
-            
-            # Convert to IterableDataset for streaming
-            # Note: streaming datasets can't use DistributedSampler easily
-            class StreamingDatasetWrapper(IterableDataset):
-                def __init__(self, stream_ds, rank, world_size):
-                    self.stream_ds = stream_ds
-                    self.rank = rank
-                    self.world_size = world_size
-                
-                def __iter__(self):
-                    for i, item in enumerate(self.stream_ds):
-                        # Simple round-robin for distributed
-                        if i % self.world_size == self.rank:
-                            yield torch.tensor(item["input_ids"], dtype=torch.long)
-            
-            dataset = StreamingDatasetWrapper(processed_ds, rank, world_size)
-            # For streaming, we can't use DistributedSampler
-            sampler = None
-            dataloader = DataLoader(
-                dataset,
-                batch_size=args.batch_size,
-                num_workers=args.num_workers or 0
-            )
-        else:
-            # Create dataset wrapper
-            dataset = HFRawTextDataset(
-                processed_ds,
-                max_length=args.hf_block_size,
-                eod_token=args.eod_token
-            )
-            
-            # Create distributed sampler if using multiple GPUs
-            if world_size > 1:
-                sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
-                dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, num_workers=args.num_workers or 0)
-            else:
-                sampler = None
-                dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers or 0)
     else:
         # Use simple text dataset
         tokenizer = SimpleTokenizer(vocab_size=args.vocab_size, eod_token=args.eod_token)

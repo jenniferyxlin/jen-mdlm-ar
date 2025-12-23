@@ -36,32 +36,14 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 #     echo "You may need to kill the process or use a different port."
 # fi
 
-# Option 1: Run in background with nohup (recommended for long training)
-# nohup torchrun --nproc_per_node=8 --master-port=25419 train.py \
-#     --distributed \
-#     --hf_raw_repo "Salesforce/wikitext" \
-#     --hf_raw_split "wikitext-2-v1" \
-#     --hf_tokenizer "gpt2" \
-#     --hf_text_column "text" \
-#     --epochs 5 \
-#     --batch_size 64 \
-#     --d_model 768 \
-#     --n_layers 12 \
-#     --n_heads 12 \
-#     --max_seq_len 512 \
-#     --use_rope \
-#     --lr 1e-4 \
-#     --experiment_name "mdlm_wikitext2_8gpu" \
-#     --save_dir ./checkpoints > training.log 2>&1 &
-
-# Option 2: Run in foreground (see output in real-time)
-torchrun --nproc_per_node=8 --master-port=25419 train.py \
+# Option 1: Run in background with nohup (recommended for 500 epochs - will take many hours)
+nohup torchrun --nproc_per_node=8 --master-port=25419 train.py \
     --distributed \
     --hf_raw_repo "Salesforce/wikitext" \
     --hf_raw_split "wikitext-2-v1" \
     --hf_tokenizer "gpt2" \
     --hf_text_column "text" \
-    --epochs 5 \
+    --epochs 500 \
     --batch_size 16 \
     --d_model 768 \
     --n_layers 12 \
@@ -70,7 +52,25 @@ torchrun --nproc_per_node=8 --master-port=25419 train.py \
     --use_rope \
     --lr 1e-4 \
     --experiment_name "mdlm_wikitext2_8gpu" \
-    --save_dir ./checkpoints
+    --save_dir ./checkpoints > training.log 2>&1 &
+
+# Option 2: Run in foreground (see output in real-time) - NOT recommended for 500 epochs
+# torchrun --nproc_per_node=8 --master-port=25419 train.py \
+#     --distributed \
+#     --hf_raw_repo "Salesforce/wikitext" \
+#     --hf_raw_split "wikitext-2-v1" \
+#     --hf_tokenizer "gpt2" \
+#     --hf_text_column "text" \
+#     --epochs 500 \
+#     --batch_size 16 \
+#     --d_model 768 \
+#     --n_layers 12 \
+#     --n_heads 12 \
+#     --max_seq_len 512 \
+#     --use_rope \
+#     --lr 1e-4 \
+#     --experiment_name "mdlm_wikitext2_8gpu" \
+#     --save_dir ./checkpoints
 
 # Single GPU training (commented out - uncomment if needed for testing)
 # python train.py \
@@ -78,7 +78,7 @@ torchrun --nproc_per_node=8 --master-port=25419 train.py \
 #     --hf_raw_split "wikitext-2-v1" \
 #     --hf_tokenizer "gpt2" \
 #     --hf_text_column "text" \
-#     --epochs 5 \
+#     --epochs 500 \
 #     --batch_size 64 \
 #     --d_model 768 \
 #     --n_layers 12 \
