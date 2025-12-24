@@ -1083,9 +1083,18 @@ def main_worker(rank, world_size, args):
         
         # CRITICAL: All ranks must synchronize here after training/validation
         if world_size > 1:
-            print(f"  [Rank {rank}] Reaching barrier after validation...", flush=True)
-            dist.barrier()
-            print(f"  [Rank {rank}] Passed barrier after validation.", flush=True)
+            try:
+                print(f"  [Rank {rank}] Reaching barrier after validation...", flush=True)
+                import sys
+                sys.stdout.flush()
+                dist.barrier()
+                print(f"  [Rank {rank}] Passed barrier after validation.", flush=True)
+                sys.stdout.flush()
+            except Exception as e:
+                print(f"  [Rank {rank}] ERROR at barrier after validation: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
+                raise
         
         # Log epoch metrics (only on rank 0)
         if rank == 0:
@@ -1094,9 +1103,18 @@ def main_worker(rank, world_size, args):
         
         # CRITICAL: Final barrier - ALL ranks must reach this before next epoch
         if world_size > 1:
-            print(f"  [Rank {rank}] Reaching final barrier...", flush=True)
-            dist.barrier()
-            print(f"  [Rank {rank}] Passed final barrier.", flush=True)
+            try:
+                print(f"  [Rank {rank}] Reaching final barrier...", flush=True)
+                import sys
+                sys.stdout.flush()
+                dist.barrier()
+                print(f"  [Rank {rank}] Passed final barrier.", flush=True)
+                sys.stdout.flush()
+            except Exception as e:
+                print(f"  [Rank {rank}] ERROR at final barrier: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
+                raise
         
         # Debug: Confirm we're continuing to next epoch
         if rank == 0:
