@@ -327,7 +327,9 @@ def train_epoch_ar(model, dataloader, optimizer, device, args, rank=0, use_hf_da
 
 def evaluate_mdlm(model, dataloader, device, args, rank=0, use_hf_data=False, max_batches=None):
     """Evaluate MDLM model."""
-    model.eval()
+    # Get the underlying model (bypass DDP to avoid synchronization issues)
+    eval_model = model.module if isinstance(model, DDP) else model
+    eval_model.eval()
     total_loss = 0
     n_batches = 0
     
@@ -354,14 +356,14 @@ def evaluate_mdlm(model, dataloader, device, args, rank=0, use_hf_data=False, ma
                     noisy_input, labels, EOD_mask, masked_indices, p_mask, position_ids = get_masked_batch(
                         tokens,
                         eps=args.eps,
-                        mask_token_id=model.module.mask_token_id if isinstance(model, DDP) else model.mask_token_id,
+                        mask_token_id=eval_model.mask_token_id,
                         device=device,
                         eod_token=args.eod_token,
                         mask_schedule=args.mask_schedule
                     )
                     
-                    # Forward pass
-                    logits = model(noisy_input, position_ids=position_ids)
+                    # Forward pass (use eval_model to bypass DDP)
+                    logits = eval_model(noisy_input, position_ids=position_ids)
                     
                     # Compute loss
                     loss = masked_cross_entropy_loss(logits, labels, EOD_mask, masked_indices, p_mask)
@@ -380,7 +382,10 @@ def evaluate_mdlm(model, dataloader, device, args, rank=0, use_hf_data=False, ma
                 del iterator
     finally:
         # Ensure model is back in train mode
-        model.train()
+        eval_model.train()
+        # Also set the DDP-wrapped model if needed
+        if isinstance(model, DDP):
+            model.train()
     
     if n_batches == 0:
         if rank == 0:
@@ -392,7 +397,9 @@ def evaluate_mdlm(model, dataloader, device, args, rank=0, use_hf_data=False, ma
 
 def evaluate_ar(model, dataloader, device, args, rank=0, use_hf_data=False, max_batches=None):
     """Evaluate AR model."""
-    model.eval()
+    # Get the underlying model (bypass DDP to avoid synchronization issues)
+    eval_model = model.module if isinstance(model, DDP) else model
+    eval_model.eval()
     total_loss = 0
     n_batches = 0
     
@@ -423,8 +430,8 @@ def evaluate_ar(model, dataloader, device, args, rank=0, use_hf_data=False, max_
                         randmask_ratio=0.0  # No random masking during evaluation
                     )
                     
-                    # Forward pass
-                    logits = model(input_ids, position_ids=position_ids, attention_mask=attention_mask)
+                    # Forward pass (use eval_model to bypass DDP)
+                    logits = eval_model(input_ids, position_ids=position_ids, attention_mask=attention_mask)
                     
                     # Compute loss
                     loss = ar_cross_entropy_loss(logits, labels, loss_mask)
@@ -443,7 +450,10 @@ def evaluate_ar(model, dataloader, device, args, rank=0, use_hf_data=False, max_
                 del iterator
     finally:
         # Ensure model is back in train mode
-        model.train()
+        eval_model.train()
+        # Also set the DDP-wrapped model if needed
+        if isinstance(model, DDP):
+            model.train()
     
     if n_batches == 0:
         if rank == 0:
@@ -1087,26 +1097,28 @@ def main_worker(rank, world_size, args):
                 metrics_logger.log_epoch(epoch, train_loss, step_losses, validation_loss=validation_loss)
         
         # CRITICAL: Final barrier - ALL ranks must reach this before next epoch
-        # This single barrier ensures all ranks wait for validation to complete
+        # Use all-reduce as a barrier (more reliable than barrier() in some NCCL setups)
         if world_size > 1:
             print(f"  [Rank {rank}] Reaching final barrier...", flush=True)
             import sys
             sys.stdout.flush()
             try:
-                # Ensure all ranks reach barrier together
-                dist.barrier()
+                # Use all-reduce as a synchronization barrier (more reliable)
+                dummy_tensor = torch.tensor([0.0], device=device)
+                dist.all_reduce(dummy_tensor, op=dist.ReduceOp.SUM)
                 # Explicitly flush and verify we passed
                 print(f"  [Rank {rank}] Passed final barrier.", flush=True)
                 sys.stdout.flush()
-                # Small delay to ensure output is written
-                import time
-                time.sleep(0.1)
             except Exception as e:
                 print(f"  [Rank {rank}] ERROR in final barrier: {e}", flush=True)
                 import traceback
                 traceback.print_exc()
-                # Try to continue anyway
-                pass
+                # Try barrier as fallback
+                try:
+                    dist.barrier()
+                    print(f"  [Rank {rank}] Passed final barrier (fallback).", flush=True)
+                except:
+                    print(f"  [Rank {rank}] WARNING: Both barrier methods failed, continuing anyway...", flush=True)
         
         # Debug: Confirm we're continuing to next epoch
         if rank == 0:
