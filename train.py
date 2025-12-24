@@ -1041,130 +1041,84 @@ def main_worker(rank, world_size, args):
                 improvement_pct = (improvement / prev_loss * 100) if prev_loss > 0 else 0
                 print(f"  Improvement:  {improvement:+.4f} ({improvement_pct:+.2f}%)")
         
-        # Run validation evaluation if validation dataloader is available
-        # CRITICAL: Move validation OUTSIDE rank==0 block so ALL ranks participate in barriers
+        # Run validation evaluation (only on rank 0, simple approach)
         validation_loss = None
-        
-        # Synchronize all ranks before validation
-        if world_size > 1:
-            dist.barrier()
-        
-        # Only rank 0 evaluates - other ranks skip entirely to avoid dataloader issues
-        # Limit to 10 batches max to prevent hanging with IterableDataset
         if rank == 0 and val_dataloader is not None:
             print(f"\n  Running validation evaluation...")
             try:
-                # Limit validation batches to prevent IterableDataset hanging
+                # Limit to 10 batches to prevent hanging
                 max_val_batches = 10
                 if model_type == 'ar':
                     validation_loss = evaluate_ar(model, val_dataloader, device, args, rank, use_hf_data=use_hf_data, max_batches=max_val_batches)
                 else:
                     validation_loss = evaluate_mdlm(model, val_dataloader, device, args, rank, use_hf_data=use_hf_data, max_batches=max_val_batches)
                 
-                # Check for valid loss value
                 if validation_loss is None or (isinstance(validation_loss, float) and (validation_loss != validation_loss or validation_loss == float('inf'))):
-                    print(f"  Warning: Invalid validation loss: {validation_loss}, skipping validation")
+                    print(f"  Warning: Invalid validation loss: {validation_loss}")
                     validation_loss = None
                 else:
                     print(f"  Validation Loss: {validation_loss:.4f}")
             except Exception as e:
-                print(f"  Error during validation evaluation: {e}")
-                import traceback
-                traceback.print_exc()
-                validation_loss = None
-            # Note: evaluate_* functions already set model.train() in their finally blocks
-        
-        # Broadcast validation loss from rank 0 to all ranks
-        # This MUST happen for all ranks to synchronize
-        if world_size > 1:
-            # Prepare tensor on all ranks
-            if rank == 0:
-                # Use a sentinel value if validation failed or wasn't run
-                if validation_loss is None:
-                    validation_loss = float('inf')
-                validation_loss_tensor = torch.tensor(validation_loss, device=device, dtype=torch.float32)
-            else:
-                # Other ranks create a placeholder tensor
-                validation_loss_tensor = torch.tensor(0.0, device=device, dtype=torch.float32)
-            
-            # Broadcast from rank 0 to all ranks - ALL ranks must participate
-            dist.broadcast(validation_loss_tensor, src=0)
-            
-            # Extract the value
-            validation_loss = validation_loss_tensor.item()
-            # Convert sentinel value back to None
-            if validation_loss == float('inf'):
+                print(f"  Error during validation: {e}")
                 validation_loss = None
         
-        # CRITICAL: Synchronize ALL processes after validation
-        # This barrier MUST be reached by ALL ranks, no exceptions
-        if world_size > 1:
-            dist.barrier()
-        
-        # Log epoch metrics (only on rank 0)
+        # Log epoch metrics and save checkpoint (only on rank 0)
         if rank == 0:
             if metrics_logger:
                 metrics_logger.log_epoch(epoch, train_loss, step_losses, validation_loss=validation_loss)
             
             # Save checkpoint (with error handling for disk space issues)
-            # Only rank 0 saves checkpoints to avoid file conflicts
             try:
-                    checkpoint = {
-                        'epoch': epoch,
-                        'model_state_dict': model_for_info.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'train_loss': train_loss,
-                    }
-                    os.makedirs(args.save_dir, exist_ok=True)
-                    # Include experiment_name in checkpoint filename to track per-run checkpoints
-                    checkpoint_path = os.path.join(args.save_dir, f'{experiment_name}_checkpoint_epoch_{epoch+1}.pt')
-                    torch.save(checkpoint, checkpoint_path)
-                    print(f"\n✓ Checkpoint saved to {checkpoint_path}")
-                    
-                    # Delete intermediate checkpoints from the current experiment, keeping only the latest
-                    # This ensures we keep only the final checkpoint for each completed run
-                    checkpoint_pattern = os.path.join(args.save_dir, f'{experiment_name}_checkpoint_epoch_*.pt')
-                    current_run_checkpoints = glob.glob(checkpoint_pattern)
-                    if len(current_run_checkpoints) > 1:
-                        # Sort by epoch number (extract from filename)
-                        def get_epoch_num(path):
-                            basename = os.path.basename(path)
-                            try:
-                                # Extract epoch number from: {experiment_name}_checkpoint_epoch_{epoch}.pt
-                                epoch_str = basename.split('_checkpoint_epoch_')[1].replace('.pt', '')
-                                return int(epoch_str)
-                            except:
-                                return 0
-                        
-                        current_run_checkpoints.sort(key=get_epoch_num)
-                        # Keep only the latest checkpoint from this run, delete all others
-                        checkpoints_to_delete = current_run_checkpoints[:-1]
-                        for old_checkpoint in checkpoints_to_delete:
-                            try:
-                                os.remove(old_checkpoint)
-                                print(f"  Deleted intermediate checkpoint: {os.path.basename(old_checkpoint)}")
-                            except Exception as e:
-                                print(f"  Warning: Could not delete {old_checkpoint}: {e}")
+                checkpoint = {
+                    'epoch': epoch,
+                    'model_state_dict': model_for_info.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'train_loss': train_loss,
+                }
+                os.makedirs(args.save_dir, exist_ok=True)
+                checkpoint_path = os.path.join(args.save_dir, f'{experiment_name}_checkpoint_epoch_{epoch+1}.pt')
+                torch.save(checkpoint, checkpoint_path)
+                print(f"\n✓ Checkpoint saved to {checkpoint_path}")
             except RuntimeError as e:
                 if "file write failed" in str(e) or "disk" in str(e).lower() or "space" in str(e).lower():
                     print(f"\n⚠ Warning: Failed to save checkpoint (likely disk space issue): {e}")
-                    print("Training will continue, but checkpoint was not saved.")
-                    print("Consider downloading/moving old checkpoints to free space:")
-                    print("  # Find large checkpoints: du -h ./checkpoints/*.pt | sort -rh")
-                    print("  # Download old ones: scp user@server:~/jen-mdlm-ar/checkpoints/checkpoint_epoch_*.pt ~/Downloads/")
-                    print("  # Then delete from server if needed: rm ./checkpoints/checkpoint_epoch_{1..50}.pt")
                 else:
                     print(f"\n⚠ Warning: Failed to save checkpoint: {e}")
-                    print("Training will continue, but checkpoint was not saved.")
             except Exception as e:
                 print(f"\n⚠ Warning: Failed to save checkpoint: {e}")
-                print("Training will continue, but checkpoint was not saved.")
         
-        # CRITICAL: Synchronize ALL processes after checkpoint saving before next epoch
-        # This barrier MUST be outside the rank==0 block so ALL ranks participate
+        # Single barrier: synchronize all ranks after validation + checkpoint
+        # This ensures all ranks proceed to next epoch together
         if world_size > 1:
             dist.barrier()
-            # All ranks have synchronized, ready for next epoch
+        
+        # Delete old checkpoints AFTER barrier (non-blocking for other ranks)
+        if rank == 0:
+            try:
+                checkpoint_pattern = os.path.join(args.save_dir, f'{experiment_name}_checkpoint_epoch_*.pt')
+                current_run_checkpoints = glob.glob(checkpoint_pattern)
+                if len(current_run_checkpoints) > 1:
+                    # Sort by epoch number (extract from filename)
+                    def get_epoch_num(path):
+                        basename = os.path.basename(path)
+                        try:
+                            epoch_str = basename.split('_checkpoint_epoch_')[1].replace('.pt', '')
+                            return int(epoch_str)
+                        except:
+                            return 0
+                    
+                    current_run_checkpoints.sort(key=get_epoch_num)
+                    # Keep only the latest checkpoint from this run, delete all others
+                    checkpoints_to_delete = current_run_checkpoints[:-1]
+                    for old_checkpoint in checkpoints_to_delete:
+                        try:
+                            os.remove(old_checkpoint)
+                            print(f"  Deleted intermediate checkpoint: {os.path.basename(old_checkpoint)}")
+                        except Exception as e:
+                            print(f"  Warning: Could not delete {old_checkpoint}: {e}")
+            except Exception as e:
+                # Silently ignore deletion errors to avoid blocking
+                pass
     
     if world_size > 1:
         cleanup_distributed()
