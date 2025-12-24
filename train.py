@@ -378,6 +378,9 @@ def evaluate_mdlm(model, dataloader, device, args, rank=0, use_hf_data=False, ma
                     pbar.close()
                 # Ensure iterator is fully consumed/exhausted
                 del iterator
+                # Force cleanup
+                import gc
+                gc.collect()
     finally:
         # Ensure model is back in train mode
         model.train()
@@ -441,6 +444,9 @@ def evaluate_ar(model, dataloader, device, args, rank=0, use_hf_data=False, max_
                     pbar.close()
                 # Ensure iterator is fully consumed/exhausted
                 del iterator
+                # Force cleanup
+                import gc
+                gc.collect()
     finally:
         # Ensure model is back in train mode
         model.train()
@@ -1037,7 +1043,6 @@ def main_worker(rank, world_size, args):
                     validation_loss = None
                 else:
                     print(f"  Validation Loss: {validation_loss:.4f}")
-                del epoch_val_dataloader
             except Exception as e:
                 print(f"  Error during validation: {e}")
                 validation_loss = None
@@ -1055,12 +1060,22 @@ def main_worker(rank, world_size, args):
             else:
                 print(f"  Validation Loss: {validation_loss:.4f}")
         
-        # Ensure model is back in train mode on all ranks (validation might have changed it)
-        model.train()
-        
-        # CRITICAL: All ranks must synchronize here before checkpoint operations
+        # CRITICAL: All ranks must synchronize here IMMEDIATELY after validation
+        # Validation only runs on rank 0, other ranks wait here
         if world_size > 1:
             dist.barrier()
+        
+        # Clean up validation dataloader AFTER barrier (non-blocking for other ranks)
+        if rank == 0 and use_hf_data and 'epoch_val_dataloader' in locals():
+            try:
+                if hasattr(epoch_val_dataloader, '_shutdown_workers'):
+                    epoch_val_dataloader._shutdown_workers()
+                del epoch_val_dataloader
+            except:
+                pass
+        
+        # Ensure model is back in train mode on all ranks (validation might have changed it)
+        model.train()
         
         # Log epoch metrics (only on rank 0)
         if rank == 0:
