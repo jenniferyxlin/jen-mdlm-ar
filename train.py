@@ -1041,12 +1041,11 @@ def main_worker(rank, world_size, args):
                 improvement_pct = (improvement / prev_loss * 100) if prev_loss > 0 else 0
                 print(f"  Improvement:  {improvement:+.4f} ({improvement_pct:+.2f}%)")
         
-        # Run validation evaluation (only on rank 0, simple approach)
+        # Run validation evaluation (only on rank 0)
         validation_loss = None
         if rank == 0 and val_dataloader is not None:
             print(f"\n  Running validation evaluation...")
             try:
-                # Limit to 10 batches to prevent hanging
                 max_val_batches = 10
                 if model_type == 'ar':
                     validation_loss = evaluate_ar(model, val_dataloader, device, args, rank, use_hf_data=use_hf_data, max_batches=max_val_batches)
@@ -1062,12 +1061,16 @@ def main_worker(rank, world_size, args):
                 print(f"  Error during validation: {e}")
                 validation_loss = None
         
+        # CRITICAL: All ranks must synchronize here before checkpoint operations
+        if world_size > 1:
+            dist.barrier()
+        
         # Log epoch metrics and save checkpoint (only on rank 0)
         if rank == 0:
             if metrics_logger:
                 metrics_logger.log_epoch(epoch, train_loss, step_losses, validation_loss=validation_loss)
             
-            # Save checkpoint (with error handling for disk space issues)
+            # Save checkpoint
             try:
                 checkpoint = {
                     'epoch': epoch,
@@ -1079,52 +1082,30 @@ def main_worker(rank, world_size, args):
                 checkpoint_path = os.path.join(args.save_dir, f'{experiment_name}_checkpoint_epoch_{epoch+1}.pt')
                 torch.save(checkpoint, checkpoint_path)
                 print(f"\n✓ Checkpoint saved to {checkpoint_path}")
-            except RuntimeError as e:
-                if "file write failed" in str(e) or "disk" in str(e).lower() or "space" in str(e).lower():
-                    print(f"\n⚠ Warning: Failed to save checkpoint (likely disk space issue): {e}")
-                else:
-                    print(f"\n⚠ Warning: Failed to save checkpoint: {e}")
-            except Exception as e:
-                print(f"\n⚠ Warning: Failed to save checkpoint: {e}")
-        
-        # Single barrier: synchronize all ranks after validation + checkpoint
-        # This ensures all ranks proceed to next epoch together
-        if world_size > 1:
-            dist.barrier()
-        
-        # Delete old checkpoints in background to avoid blocking
-        # Do this BEFORE the barrier so rank 0 can start deletion while others wait
-        if rank == 0:
-            import threading
-            def delete_old_checkpoints():
+                
+                # Delete old checkpoints immediately (synchronous, but fast)
                 try:
                     checkpoint_pattern = os.path.join(args.save_dir, f'{experiment_name}_checkpoint_epoch_*.pt')
                     current_run_checkpoints = glob.glob(checkpoint_pattern)
                     if len(current_run_checkpoints) > 1:
                         def get_epoch_num(path):
-                            basename = os.path.basename(path)
                             try:
-                                epoch_str = basename.split('_checkpoint_epoch_')[1].replace('.pt', '')
-                                return int(epoch_str)
+                                return int(os.path.basename(path).split('_checkpoint_epoch_')[1].replace('.pt', ''))
                             except:
                                 return 0
-                        
                         current_run_checkpoints.sort(key=get_epoch_num)
-                        checkpoints_to_delete = current_run_checkpoints[:-1]
-                        for old_checkpoint in checkpoints_to_delete:
+                        for old_checkpoint in current_run_checkpoints[:-1]:
                             try:
                                 os.remove(old_checkpoint)
                                 print(f"  Deleted intermediate checkpoint: {os.path.basename(old_checkpoint)}")
-                            except Exception:
-                                pass  # Ignore deletion errors
-                except Exception:
-                    pass  # Ignore all errors
-            
-            # Start deletion in background thread - non-blocking
-            deletion_thread = threading.Thread(target=delete_old_checkpoints, daemon=True)
-            deletion_thread.start()
+                            except:
+                                pass
+                except:
+                    pass
+            except Exception as e:
+                print(f"\n⚠ Warning: Failed to save checkpoint: {e}")
         
-        # Barrier ensures all ranks proceed together - deletion happens in background
+        # CRITICAL: Final barrier - ALL ranks must reach this before next epoch
         if world_size > 1:
             dist.barrier()
     
