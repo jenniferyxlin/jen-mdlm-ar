@@ -1024,7 +1024,9 @@ def main_worker(rank, world_size, args):
         # CRITICAL: Synchronize all ranks after training, before validation
         # This ensures all ranks have finished training before rank 0 starts validation
         if world_size > 1:
+            print(f"  [Rank {rank}] Reaching barrier before validation...", flush=True)
             dist.barrier()
+            print(f"  [Rank {rank}] Passed barrier before validation.", flush=True)
         
         # Run validation evaluation (only on rank 0)
         # Recreate validation dataloader each epoch to avoid IterableDataset iterator issues
