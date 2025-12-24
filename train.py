@@ -1034,6 +1034,7 @@ def main_worker(rank, world_size, args):
             dist.barrier()
         
         # Log epoch metrics and save checkpoint (only on rank 0)
+        checkpoint_path = None
         if rank == 0:
             if metrics_logger:
                 metrics_logger.log_epoch(epoch, train_loss, step_losses, validation_loss=validation_loss)
@@ -1051,36 +1052,40 @@ def main_worker(rank, world_size, args):
                 checkpoint_path = os.path.join(args.save_dir, f'{experiment_name}_checkpoint_epoch_{epoch+1}.pt')
                 torch.save(checkpoint, checkpoint_path)
                 print(f"\n✓ Checkpoint saved to {checkpoint_path}")
-                
-                # Immediately delete old checkpoints, keeping only the latest
-                try:
-                    checkpoint_pattern = os.path.join(args.save_dir, f'{experiment_name}_checkpoint_epoch_*.pt')
-                    current_run_checkpoints = glob.glob(checkpoint_pattern)
-                    if len(current_run_checkpoints) > 1:
-                        def get_epoch_num(path):
-                            try:
-                                return int(os.path.basename(path).split('_checkpoint_epoch_')[1].replace('.pt', ''))
-                            except:
-                                return 0
-                        current_run_checkpoints.sort(key=get_epoch_num)
-                        # Delete all except the latest (which we just saved)
-                        for old_checkpoint in current_run_checkpoints[:-1]:
-                            try:
-                                os.remove(old_checkpoint)
-                                print(f"  Deleted old checkpoint: {os.path.basename(old_checkpoint)}")
-                            except:
-                                pass
-                except:
-                    pass  # Ignore deletion errors
             except Exception as e:
                 print(f"\n⚠ Warning: Failed to save checkpoint: {e}")
                 import traceback
                 traceback.print_exc()
+                checkpoint_path = None  # Mark that checkpoint saving failed
         
         # CRITICAL: Final barrier - ALL ranks must reach this before next epoch
         # This MUST be outside rank==0 block - ALL ranks participate
         if world_size > 1:
             dist.barrier()
+        
+        # Delete old checkpoints AFTER barrier (non-blocking for other ranks)
+        if rank == 0 and checkpoint_path is not None:
+            try:
+                checkpoint_pattern = os.path.join(args.save_dir, f'{experiment_name}_checkpoint_epoch_*.pt')
+                current_run_checkpoints = glob.glob(checkpoint_pattern)
+                # Filter out the checkpoint we just saved
+                checkpoints_to_delete = [cp for cp in current_run_checkpoints if cp != checkpoint_path]
+                if checkpoints_to_delete:
+                    def get_epoch_num(path):
+                        try:
+                            return int(os.path.basename(path).split('_checkpoint_epoch_')[1].replace('.pt', ''))
+                        except:
+                            return 0
+                    checkpoints_to_delete.sort(key=get_epoch_num)
+                    # Delete all old checkpoints
+                    for old_checkpoint in checkpoints_to_delete:
+                        try:
+                            os.remove(old_checkpoint)
+                            print(f"  Deleted old checkpoint: {os.path.basename(old_checkpoint)}")
+                        except:
+                            pass
+            except:
+                pass  # Ignore deletion errors
     
     if world_size > 1:
         cleanup_distributed()
