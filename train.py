@@ -1092,13 +1092,28 @@ def main_worker(rank, world_size, args):
             print(f"  [Rank {rank}] Reaching final barrier...", flush=True)
             import sys
             sys.stdout.flush()
-            dist.barrier()
-            print(f"  [Rank {rank}] Passed final barrier.", flush=True)
-            sys.stdout.flush()
+            try:
+                # Ensure all ranks reach barrier together
+                dist.barrier()
+                # Explicitly flush and verify we passed
+                print(f"  [Rank {rank}] Passed final barrier.", flush=True)
+                sys.stdout.flush()
+                # Small delay to ensure output is written
+                import time
+                time.sleep(0.1)
+            except Exception as e:
+                print(f"  [Rank {rank}] ERROR in final barrier: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
+                # Try to continue anyway
+                pass
         
         # Debug: Confirm we're continuing to next epoch
         if rank == 0:
             print(f"  Epoch {epoch + 1}/{args.epochs} completed. Starting next epoch...\n", flush=True)
+        elif world_size > 1:
+            # Non-rank-0 ranks also confirm they're continuing
+            print(f"  [Rank {rank}] Continuing to next epoch...", flush=True)
     
     if world_size > 1:
         cleanup_distributed()
