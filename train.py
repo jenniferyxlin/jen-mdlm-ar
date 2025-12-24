@@ -1081,40 +1081,20 @@ def main_worker(rank, world_size, args):
         # Ensure model is back in train mode on all ranks
         model.train()
         
-        # CRITICAL: All ranks must synchronize here after training/validation
-        if world_size > 1:
-            try:
-                print(f"  [Rank {rank}] Reaching barrier after validation...", flush=True)
-                import sys
-                sys.stdout.flush()
-                dist.barrier()
-                print(f"  [Rank {rank}] Passed barrier after validation.", flush=True)
-                sys.stdout.flush()
-            except Exception as e:
-                print(f"  [Rank {rank}] ERROR at barrier after validation: {e}", flush=True)
-                import traceback
-                traceback.print_exc()
-                raise
-        
         # Log epoch metrics (only on rank 0)
         if rank == 0:
             if metrics_logger:
                 metrics_logger.log_epoch(epoch, train_loss, step_losses, validation_loss=validation_loss)
         
         # CRITICAL: Final barrier - ALL ranks must reach this before next epoch
+        # This single barrier ensures all ranks wait for validation to complete
         if world_size > 1:
-            try:
-                print(f"  [Rank {rank}] Reaching final barrier...", flush=True)
-                import sys
-                sys.stdout.flush()
-                dist.barrier()
-                print(f"  [Rank {rank}] Passed final barrier.", flush=True)
-                sys.stdout.flush()
-            except Exception as e:
-                print(f"  [Rank {rank}] ERROR at final barrier: {e}", flush=True)
-                import traceback
-                traceback.print_exc()
-                raise
+            print(f"  [Rank {rank}] Reaching final barrier...", flush=True)
+            import sys
+            sys.stdout.flush()
+            dist.barrier()
+            print(f"  [Rank {rank}] Passed final barrier.", flush=True)
+            sys.stdout.flush()
         
         # Debug: Confirm we're continuing to next epoch
         if rank == 0:
