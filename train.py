@@ -1029,83 +1029,54 @@ def main_worker(rank, world_size, args):
         # Run validation evaluation (only on rank 0)
         # Recreate validation dataloader each epoch to avoid IterableDataset iterator issues
         validation_loss = None
-        if rank == 0 and use_hf_data:
+        if rank == 0:
             try:
-                epoch_val_dataloader = get_dataloader(
-                    hf_repo=args.hf_repo,
-                    batch_size=args.batch_size,
-                    seq_len=args.max_seq_len,
-                    rank=rank,
-                    world_size=world_size,
-                    split='validation',
-                    max_tokens=None,
-                    epoch=epoch,
-                    version=args.hf_version,
-                    subset=args.hf_subset,
-                    replicate_shards=True,
-                    num_workers=0,
-                )
-                print(f"\n  Running validation evaluation...")
-                max_val_batches = 10
-                if model_type == 'ar':
-                    validation_loss = evaluate_ar(model, epoch_val_dataloader, device, args, rank, use_hf_data=use_hf_data, max_batches=max_val_batches)
-                else:
-                    validation_loss = evaluate_mdlm(model, epoch_val_dataloader, device, args, rank, use_hf_data=use_hf_data, max_batches=max_val_batches)
+                if use_hf_data:
+                    epoch_val_dataloader = get_dataloader(
+                        hf_repo=args.hf_repo,
+                        batch_size=args.batch_size,
+                        seq_len=args.max_seq_len,
+                        rank=0,  # Always use rank 0 for validation dataloader
+                        world_size=1,  # Use world_size=1 to avoid distributed operations in dataloader
+                        split='validation',
+                        max_tokens=None,
+                        epoch=epoch,
+                        version=args.hf_version,
+                        subset=args.hf_subset,
+                        replicate_shards=True,
+                        num_workers=0,
+                    )
+                    print(f"\n  Running validation evaluation...", flush=True)
+                    max_val_batches = 10
+                    if model_type == 'ar':
+                        validation_loss = evaluate_ar(model, epoch_val_dataloader, device, args, rank=0, use_hf_data=use_hf_data, max_batches=max_val_batches)
+                    else:
+                        validation_loss = evaluate_mdlm(model, epoch_val_dataloader, device, args, rank=0, use_hf_data=use_hf_data, max_batches=max_val_batches)
+                elif val_dataloader is not None:
+                    print(f"\n  Running validation evaluation...", flush=True)
+                    max_val_batches = 10
+                    if model_type == 'ar':
+                        validation_loss = evaluate_ar(model, val_dataloader, device, args, rank=0, use_hf_data=use_hf_data, max_batches=max_val_batches)
+                    else:
+                        validation_loss = evaluate_mdlm(model, val_dataloader, device, args, rank=0, use_hf_data=use_hf_data, max_batches=max_val_batches)
                 
                 if validation_loss is None or (isinstance(validation_loss, float) and (validation_loss != validation_loss or validation_loss == float('inf'))):
-                    print(f"  Warning: Invalid validation loss: {validation_loss}")
+                    print(f"  Warning: Invalid validation loss: {validation_loss}", flush=True)
                     validation_loss = None
                 else:
-                    print(f"  Validation Loss: {validation_loss:.4f}")
+                    print(f"  Validation Loss: {validation_loss:.4f}", flush=True)
             except Exception as e:
-                print(f"  Error during validation: {e}")
-                import traceback
-                traceback.print_exc()
-                validation_loss = None
-        elif rank == 0 and val_dataloader is not None:
-            try:
-                print(f"\n  Running validation evaluation...")
-                max_val_batches = 10
-                if model_type == 'ar':
-                    validation_loss = evaluate_ar(model, val_dataloader, device, args, rank, use_hf_data=use_hf_data, max_batches=max_val_batches)
-                else:
-                    validation_loss = evaluate_mdlm(model, val_dataloader, device, args, rank, use_hf_data=use_hf_data, max_batches=max_val_batches)
-                
-                if validation_loss is None or (isinstance(validation_loss, float) and (validation_loss != validation_loss or validation_loss == float('inf'))):
-                    print(f"  Warning: Invalid validation loss: {validation_loss}")
-                    validation_loss = None
-                else:
-                    print(f"  Validation Loss: {validation_loss:.4f}")
-            except Exception as e:
-                print(f"  Error during validation: {e}")
+                print(f"  Error during validation: {e}", flush=True)
                 import traceback
                 traceback.print_exc()
                 validation_loss = None
         
-        # All ranks print status after validation
-        if world_size > 1 and rank == 0:
-            print(f"  [Rank 0] Validation complete, proceeding to cleanup...", flush=True)
-        elif world_size > 1:
-            print(f"  [Rank {rank}] Waiting for rank 0 to finish validation...", flush=True)
-        
-        # Clean up validation dataloader (only on rank 0)
-        # Skip cleanup to avoid potential hangs - dataloader will be garbage collected
-        # if rank == 0 and use_hf_data and 'epoch_val_dataloader' in locals():
-        #     try:
-        #         if hasattr(epoch_val_dataloader, '_shutdown_workers'):
-        #             epoch_val_dataloader._shutdown_workers()
-        #         del epoch_val_dataloader
-        #     except:
-        #         pass
-        
-        # Ensure model is back in train mode on all ranks (validation might have changed it)
+        # Ensure model is back in train mode on all ranks
         model.train()
         
-        # CRITICAL: All ranks must synchronize here IMMEDIATELY after validation
+        # CRITICAL: All ranks must synchronize here after training/validation
         if world_size > 1:
-            print(f"  [Rank {rank}] Reaching barrier after validation...", flush=True)
             dist.barrier()
-            print(f"  [Rank {rank}] Passed barrier after validation.", flush=True)
         
         # Log epoch metrics (only on rank 0)
         if rank == 0:
@@ -1114,15 +1085,11 @@ def main_worker(rank, world_size, args):
         
         # CRITICAL: Final barrier - ALL ranks must reach this before next epoch
         if world_size > 1:
-            print(f"  [Rank {rank}] Reaching final barrier...", flush=True)
             dist.barrier()
-            print(f"  [Rank {rank}] Passed final barrier.", flush=True)
         
         # Debug: Confirm we're continuing to next epoch
-        import sys
         if rank == 0:
             print(f"  Epoch {epoch + 1}/{args.epochs} completed. Starting next epoch...\n", flush=True)
-            sys.stdout.flush()
     
     if world_size > 1:
         cleanup_distributed()
