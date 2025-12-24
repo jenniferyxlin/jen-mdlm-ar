@@ -1092,33 +1092,41 @@ def main_worker(rank, world_size, args):
         if world_size > 1:
             dist.barrier()
         
-        # Delete old checkpoints AFTER barrier (non-blocking for other ranks)
+        # Delete old checkpoints in background to avoid blocking
+        # Do this BEFORE the barrier so rank 0 can start deletion while others wait
         if rank == 0:
-            try:
-                checkpoint_pattern = os.path.join(args.save_dir, f'{experiment_name}_checkpoint_epoch_*.pt')
-                current_run_checkpoints = glob.glob(checkpoint_pattern)
-                if len(current_run_checkpoints) > 1:
-                    # Sort by epoch number (extract from filename)
-                    def get_epoch_num(path):
-                        basename = os.path.basename(path)
-                        try:
-                            epoch_str = basename.split('_checkpoint_epoch_')[1].replace('.pt', '')
-                            return int(epoch_str)
-                        except:
-                            return 0
-                    
-                    current_run_checkpoints.sort(key=get_epoch_num)
-                    # Keep only the latest checkpoint from this run, delete all others
-                    checkpoints_to_delete = current_run_checkpoints[:-1]
-                    for old_checkpoint in checkpoints_to_delete:
-                        try:
-                            os.remove(old_checkpoint)
-                            print(f"  Deleted intermediate checkpoint: {os.path.basename(old_checkpoint)}")
-                        except Exception as e:
-                            print(f"  Warning: Could not delete {old_checkpoint}: {e}")
-            except Exception as e:
-                # Silently ignore deletion errors to avoid blocking
-                pass
+            import threading
+            def delete_old_checkpoints():
+                try:
+                    checkpoint_pattern = os.path.join(args.save_dir, f'{experiment_name}_checkpoint_epoch_*.pt')
+                    current_run_checkpoints = glob.glob(checkpoint_pattern)
+                    if len(current_run_checkpoints) > 1:
+                        def get_epoch_num(path):
+                            basename = os.path.basename(path)
+                            try:
+                                epoch_str = basename.split('_checkpoint_epoch_')[1].replace('.pt', '')
+                                return int(epoch_str)
+                            except:
+                                return 0
+                        
+                        current_run_checkpoints.sort(key=get_epoch_num)
+                        checkpoints_to_delete = current_run_checkpoints[:-1]
+                        for old_checkpoint in checkpoints_to_delete:
+                            try:
+                                os.remove(old_checkpoint)
+                                print(f"  Deleted intermediate checkpoint: {os.path.basename(old_checkpoint)}")
+                            except Exception:
+                                pass  # Ignore deletion errors
+                except Exception:
+                    pass  # Ignore all errors
+            
+            # Start deletion in background thread - non-blocking
+            deletion_thread = threading.Thread(target=delete_old_checkpoints, daemon=True)
+            deletion_thread.start()
+        
+        # Barrier ensures all ranks proceed together - deletion happens in background
+        if world_size > 1:
+            dist.barrier()
     
     if world_size > 1:
         cleanup_distributed()
