@@ -371,6 +371,12 @@ def evaluate_mdlm(model, dataloader, device, args, rank=0, use_hf_data=False, ma
                     
                     # Limit number of batches for validation to avoid hanging
                     if max_batches is not None and n_batches >= max_batches:
+                        # For IterableDataset, consume remaining iterator to avoid hanging
+                        try:
+                            while True:
+                                next(iterator)
+                        except StopIteration:
+                            pass
                         break
             finally:
                 # Explicitly close progress bar to release resources
@@ -434,6 +440,12 @@ def evaluate_ar(model, dataloader, device, args, rank=0, use_hf_data=False, max_
                     
                     # Limit number of batches for validation to avoid hanging
                     if max_batches is not None and n_batches >= max_batches:
+                        # For IterableDataset, consume remaining iterator to avoid hanging
+                        try:
+                            while True:
+                                next(iterator)
+                        except StopIteration:
+                            pass
                         break
             finally:
                 # Explicitly close progress bar to release resources
@@ -1010,21 +1022,17 @@ def main_worker(rank, world_size, args):
         validation_loss = None
         if rank == 0 and val_dataloader is not None:
             print(f"\n  Running validation evaluation...")
-            try:
-                max_val_batches = 10
-                if model_type == 'ar':
-                    validation_loss = evaluate_ar(model, val_dataloader, device, args, rank, use_hf_data=use_hf_data, max_batches=max_val_batches)
-                else:
-                    validation_loss = evaluate_mdlm(model, val_dataloader, device, args, rank, use_hf_data=use_hf_data, max_batches=max_val_batches)
-                
-                if validation_loss is None or (isinstance(validation_loss, float) and (validation_loss != validation_loss or validation_loss == float('inf'))):
-                    print(f"  Warning: Invalid validation loss: {validation_loss}")
-                    validation_loss = None
-                else:
-                    print(f"  Validation Loss: {validation_loss:.4f}")
-            except Exception as e:
-                print(f"  Error during validation: {e}")
+            max_val_batches = 10
+            if model_type == 'ar':
+                validation_loss = evaluate_ar(model, val_dataloader, device, args, rank, use_hf_data=use_hf_data, max_batches=max_val_batches)
+            else:
+                validation_loss = evaluate_mdlm(model, val_dataloader, device, args, rank, use_hf_data=use_hf_data, max_batches=max_val_batches)
+            
+            if validation_loss is None or (isinstance(validation_loss, float) and (validation_loss != validation_loss or validation_loss == float('inf'))):
+                print(f"  Warning: Invalid validation loss: {validation_loss}")
                 validation_loss = None
+            else:
+                print(f"  Validation Loss: {validation_loss:.4f}")
         
         # Ensure model is back in train mode on all ranks (validation might have changed it)
         model.train()
@@ -1034,58 +1042,25 @@ def main_worker(rank, world_size, args):
             dist.barrier()
         
         # Log epoch metrics and save checkpoint (only on rank 0)
-        checkpoint_path = None
         if rank == 0:
             if metrics_logger:
                 metrics_logger.log_epoch(epoch, train_loss, step_losses, validation_loss=validation_loss)
             
-            # Save checkpoint - wrapped in try/except to ensure we always reach barrier
-            try:
-                model.train()  # Ensure model is in train mode
-                checkpoint = {
-                    'epoch': epoch,
-                    'model_state_dict': model_for_info.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'train_loss': train_loss,
-                }
-                os.makedirs(args.save_dir, exist_ok=True)
-                checkpoint_path = os.path.join(args.save_dir, f'{experiment_name}_checkpoint_epoch_{epoch+1}.pt')
-                torch.save(checkpoint, checkpoint_path)
-                print(f"\n✓ Checkpoint saved to {checkpoint_path}")
-            except Exception as e:
-                print(f"\n⚠ Warning: Failed to save checkpoint: {e}")
-                import traceback
-                traceback.print_exc()
-                checkpoint_path = None  # Mark that checkpoint saving failed
+            model.train()
+            checkpoint = {
+                'epoch': epoch,
+                'model_state_dict': model_for_info.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'train_loss': train_loss,
+            }
+            os.makedirs(args.save_dir, exist_ok=True)
+            checkpoint_path = os.path.join(args.save_dir, f'{experiment_name}_checkpoint_epoch_{epoch+1}.pt')
+            torch.save(checkpoint, checkpoint_path)
+            print(f"\n✓ Checkpoint saved to {checkpoint_path}")
         
         # CRITICAL: Final barrier - ALL ranks must reach this before next epoch
-        # This MUST be outside rank==0 block - ALL ranks participate
         if world_size > 1:
             dist.barrier()
-        
-        # Delete old checkpoints AFTER barrier (non-blocking for other ranks)
-        if rank == 0 and checkpoint_path is not None:
-            try:
-                checkpoint_pattern = os.path.join(args.save_dir, f'{experiment_name}_checkpoint_epoch_*.pt')
-                current_run_checkpoints = glob.glob(checkpoint_pattern)
-                # Filter out the checkpoint we just saved
-                checkpoints_to_delete = [cp for cp in current_run_checkpoints if cp != checkpoint_path]
-                if checkpoints_to_delete:
-                    def get_epoch_num(path):
-                        try:
-                            return int(os.path.basename(path).split('_checkpoint_epoch_')[1].replace('.pt', ''))
-                        except:
-                            return 0
-                    checkpoints_to_delete.sort(key=get_epoch_num)
-                    # Delete all old checkpoints
-                    for old_checkpoint in checkpoints_to_delete:
-                        try:
-                            os.remove(old_checkpoint)
-                            print(f"  Deleted old checkpoint: {os.path.basename(old_checkpoint)}")
-                        except:
-                            pass
-            except:
-                pass  # Ignore deletion errors
     
     if world_size > 1:
         cleanup_distributed()
@@ -1094,6 +1069,29 @@ def main_worker(rank, world_size, args):
         print(f"\n{'='*60}")
         print("Training Complete!")
         print(f"{'='*60}")
+        
+        # Clean up old checkpoints, keeping only the latest one
+        try:
+            checkpoint_pattern = os.path.join(args.save_dir, f'{experiment_name}_checkpoint_epoch_*.pt')
+            current_run_checkpoints = glob.glob(checkpoint_pattern)
+            if len(current_run_checkpoints) > 1:
+                def get_epoch_num(path):
+                    try:
+                        return int(os.path.basename(path).split('_checkpoint_epoch_')[1].replace('.pt', ''))
+                    except:
+                        return 0
+                current_run_checkpoints.sort(key=get_epoch_num)
+                checkpoints_to_delete = current_run_checkpoints[:-1]
+                for old_checkpoint in checkpoints_to_delete:
+                    try:
+                        os.remove(old_checkpoint)
+                        print(f"  Deleted old checkpoint: {os.path.basename(old_checkpoint)}")
+                    except Exception as e:
+                        print(f"  Warning: Could not delete {os.path.basename(old_checkpoint)}: {e}")
+                if checkpoints_to_delete:
+                    print(f"✓ Kept latest checkpoint: {os.path.basename(current_run_checkpoints[-1])}")
+        except Exception as e:
+            print(f"  Warning: Could not clean up checkpoints: {e}")
         
         if metrics_logger:
             metrics_file = metrics_logger.save()
