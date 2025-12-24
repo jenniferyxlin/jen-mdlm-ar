@@ -44,12 +44,33 @@ export MASTER_PORT=$MASTER_PORT
 # Create logs directory
 mkdir -p logs
 
+# Function to cleanup port before training
+cleanup_port() {
+    local port=$1
+    # Try multiple methods to kill process using the port
+    fuser -k ${port}/tcp 2>/dev/null
+    # Also try with netstat/ss
+    local pid=$(netstat -tlnp 2>/dev/null | grep ":${port} " | awk '{print $7}' | cut -d'/' -f1 | head -1)
+    if [ ! -z "$pid" ]; then
+        kill -9 $pid 2>/dev/null
+    fi
+    local pid2=$(ss -tlnp 2>/dev/null | grep ":${port} " | awk '{print $6}' | cut -d',' -f2 | cut -d'=' -f2 | head -1)
+    if [ ! -z "$pid2" ]; then
+        kill -9 $pid2 2>/dev/null
+    fi
+    # Small delay to ensure port is released
+    sleep 2
+}
+
 # Function to run training and wait for completion
 run_training() {
     local model_type=$1
     local epochs=$2
     local log_file="logs/${model_type}_${epochs}epochs.log"
     local metrics_file="${SAVE_DIR}/${model_type}_wikitext2_${epochs}epochs_metrics.json"
+    
+    # Cleanup port before starting
+    cleanup_port $MASTER_PORT
     
     # Check if this run already completed
     if [ -f "$metrics_file" ]; then
@@ -143,8 +164,8 @@ for epochs in "${EPOCHS[@]}"; do
             exit 1
         fi
         
-        # Small delay between jobs to ensure clean shutdown
-        sleep 5
+        # Small delay between jobs to ensure clean shutdown and port release
+        sleep 10
     done
 done
 
