@@ -1082,21 +1082,30 @@ def main_worker(rank, world_size, args):
                 traceback.print_exc()
                 validation_loss = None
         
+        # All ranks print status after validation
+        if world_size > 1 and rank == 0:
+            print(f"  [Rank 0] Validation complete, proceeding to cleanup...", flush=True)
+        elif world_size > 1:
+            print(f"  [Rank {rank}] Waiting for rank 0 to finish validation...", flush=True)
+        
         # Clean up validation dataloader (only on rank 0)
-        if rank == 0 and use_hf_data and 'epoch_val_dataloader' in locals():
-            try:
-                if hasattr(epoch_val_dataloader, '_shutdown_workers'):
-                    epoch_val_dataloader._shutdown_workers()
-                del epoch_val_dataloader
-            except:
-                pass
+        # Skip cleanup to avoid potential hangs - dataloader will be garbage collected
+        # if rank == 0 and use_hf_data and 'epoch_val_dataloader' in locals():
+        #     try:
+        #         if hasattr(epoch_val_dataloader, '_shutdown_workers'):
+        #             epoch_val_dataloader._shutdown_workers()
+        #         del epoch_val_dataloader
+        #     except:
+        #         pass
         
         # Ensure model is back in train mode on all ranks (validation might have changed it)
         model.train()
         
         # CRITICAL: All ranks must synchronize here IMMEDIATELY after validation
         if world_size > 1:
+            print(f"  [Rank {rank}] Reaching barrier after validation...", flush=True)
             dist.barrier()
+            print(f"  [Rank {rank}] Passed barrier after validation.", flush=True)
         
         # Log epoch metrics (only on rank 0)
         if rank == 0:
@@ -1105,7 +1114,9 @@ def main_worker(rank, world_size, args):
         
         # CRITICAL: Final barrier - ALL ranks must reach this before next epoch
         if world_size > 1:
+            print(f"  [Rank {rank}] Reaching final barrier...", flush=True)
             dist.barrier()
+            print(f"  [Rank {rank}] Passed final barrier.", flush=True)
         
         # Debug: Confirm we're continuing to next epoch
         import sys
