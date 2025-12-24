@@ -1082,26 +1082,6 @@ def main_worker(rank, world_size, args):
                 checkpoint_path = os.path.join(args.save_dir, f'{experiment_name}_checkpoint_epoch_{epoch+1}.pt')
                 torch.save(checkpoint, checkpoint_path)
                 print(f"\n✓ Checkpoint saved to {checkpoint_path}")
-                
-                # Delete old checkpoints immediately (synchronous, but fast)
-                try:
-                    checkpoint_pattern = os.path.join(args.save_dir, f'{experiment_name}_checkpoint_epoch_*.pt')
-                    current_run_checkpoints = glob.glob(checkpoint_pattern)
-                    if len(current_run_checkpoints) > 1:
-                        def get_epoch_num(path):
-                            try:
-                                return int(os.path.basename(path).split('_checkpoint_epoch_')[1].replace('.pt', ''))
-                            except:
-                                return 0
-                        current_run_checkpoints.sort(key=get_epoch_num)
-                        for old_checkpoint in current_run_checkpoints[:-1]:
-                            try:
-                                os.remove(old_checkpoint)
-                                print(f"  Deleted intermediate checkpoint: {os.path.basename(old_checkpoint)}")
-                            except:
-                                pass
-                except:
-                    pass
             except Exception as e:
                 print(f"\n⚠ Warning: Failed to save checkpoint: {e}")
         
@@ -1116,6 +1096,29 @@ def main_worker(rank, world_size, args):
         print(f"\n{'='*60}")
         print("Training Complete!")
         print(f"{'='*60}")
+        
+        # Clean up old checkpoints, keeping only the latest one
+        try:
+            checkpoint_pattern = os.path.join(args.save_dir, f'{experiment_name}_checkpoint_epoch_*.pt')
+            current_run_checkpoints = glob.glob(checkpoint_pattern)
+            if len(current_run_checkpoints) > 1:
+                def get_epoch_num(path):
+                    try:
+                        return int(os.path.basename(path).split('_checkpoint_epoch_')[1].replace('.pt', ''))
+                    except:
+                        return 0
+                current_run_checkpoints.sort(key=get_epoch_num)
+                checkpoints_to_delete = current_run_checkpoints[:-1]
+                for old_checkpoint in checkpoints_to_delete:
+                    try:
+                        os.remove(old_checkpoint)
+                        print(f"  Deleted intermediate checkpoint: {os.path.basename(old_checkpoint)}")
+                    except Exception as e:
+                        print(f"  Warning: Could not delete {os.path.basename(old_checkpoint)}: {e}")
+                if checkpoints_to_delete:
+                    print(f"✓ Kept latest checkpoint: {os.path.basename(current_run_checkpoints[-1])}")
+        except Exception as e:
+            print(f"  Warning: Could not clean up checkpoints: {e}")
         
         if metrics_logger:
             metrics_file = metrics_logger.save()
