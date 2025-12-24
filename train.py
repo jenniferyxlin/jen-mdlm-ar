@@ -1062,22 +1062,10 @@ def main_worker(rank, world_size, args):
         if world_size > 1:
             dist.barrier()
         
-        # Log epoch metrics and save checkpoint (only on rank 0)
+        # Log epoch metrics (only on rank 0)
         if rank == 0:
             if metrics_logger:
                 metrics_logger.log_epoch(epoch, train_loss, step_losses, validation_loss=validation_loss)
-            
-            model.train()
-            checkpoint = {
-                'epoch': epoch,
-                'model_state_dict': model_for_info.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'train_loss': train_loss,
-            }
-            os.makedirs(args.save_dir, exist_ok=True)
-            checkpoint_path = os.path.join(args.save_dir, f'{experiment_name}_checkpoint_epoch_{epoch+1}.pt')
-            torch.save(checkpoint, checkpoint_path)
-            print(f"\n✓ Checkpoint saved to {checkpoint_path}")
         
         # CRITICAL: Final barrier - ALL ranks must reach this before next epoch
         if world_size > 1:
