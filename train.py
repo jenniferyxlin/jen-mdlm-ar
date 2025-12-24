@@ -325,7 +325,7 @@ def train_epoch_ar(model, dataloader, optimizer, device, args, rank=0, use_hf_da
     return avg_loss, step_losses
 
 
-def evaluate_mdlm(model, dataloader, device, args, rank=0, use_hf_data=False):
+def evaluate_mdlm(model, dataloader, device, args, rank=0, use_hf_data=False, max_batches=None):
     """Evaluate MDLM model."""
     model.eval()
     total_loss = 0
@@ -334,8 +334,14 @@ def evaluate_mdlm(model, dataloader, device, args, rank=0, use_hf_data=False):
     try:
         with torch.no_grad():
             pbar = tqdm(dataloader, desc="Evaluating", disable=(rank != 0)) if rank == 0 else dataloader
+            iterator = iter(pbar)
             try:
-                for batch in pbar:
+                while True:
+                    try:
+                        batch = next(iterator)
+                    except StopIteration:
+                        break
+                    
                     # Handle HuggingFace data format (x, y) tuples vs simple token tensors
                     if use_hf_data:
                         x, y = batch
@@ -362,10 +368,16 @@ def evaluate_mdlm(model, dataloader, device, args, rank=0, use_hf_data=False):
                     
                     total_loss += loss.item()
                     n_batches += 1
+                    
+                    # Limit number of batches for validation to avoid hanging
+                    if max_batches is not None and n_batches >= max_batches:
+                        break
             finally:
                 # Explicitly close progress bar to release resources
                 if rank == 0 and hasattr(pbar, 'close'):
                     pbar.close()
+                # Ensure iterator is fully consumed/exhausted
+                del iterator
     finally:
         # Ensure model is back in train mode
         model.train()
@@ -378,7 +390,7 @@ def evaluate_mdlm(model, dataloader, device, args, rank=0, use_hf_data=False):
     return total_loss / n_batches
 
 
-def evaluate_ar(model, dataloader, device, args, rank=0, use_hf_data=False):
+def evaluate_ar(model, dataloader, device, args, rank=0, use_hf_data=False, max_batches=None):
     """Evaluate AR model."""
     model.eval()
     total_loss = 0
@@ -387,8 +399,14 @@ def evaluate_ar(model, dataloader, device, args, rank=0, use_hf_data=False):
     try:
         with torch.no_grad():
             pbar = tqdm(dataloader, desc="Evaluating", disable=(rank != 0)) if rank == 0 else dataloader
+            iterator = iter(pbar)
             try:
-                for batch in pbar:
+                while True:
+                    try:
+                        batch = next(iterator)
+                    except StopIteration:
+                        break
+                    
                     # Handle HuggingFace data format (x, y) tuples vs simple token tensors
                     if use_hf_data:
                         x, y = batch
@@ -413,10 +431,16 @@ def evaluate_ar(model, dataloader, device, args, rank=0, use_hf_data=False):
                     
                     total_loss += loss.item()
                     n_batches += 1
+                    
+                    # Limit number of batches for validation to avoid hanging
+                    if max_batches is not None and n_batches >= max_batches:
+                        break
             finally:
                 # Explicitly close progress bar to release resources
                 if rank == 0 and hasattr(pbar, 'close'):
                     pbar.close()
+                # Ensure iterator is fully consumed/exhausted
+                del iterator
     finally:
         # Ensure model is back in train mode
         model.train()
@@ -1012,73 +1036,75 @@ def main_worker(rank, world_size, args):
                 improvement = prev_loss - train_loss
                 improvement_pct = (improvement / prev_loss * 100) if prev_loss > 0 else 0
                 print(f"  Improvement:  {improvement:+.4f} ({improvement_pct:+.2f}%)")
-            
-            # Run validation evaluation if validation dataloader is available
-            # CRITICAL: Only evaluate on rank 0 to avoid dataloader blocking issues
-            validation_loss = None
-            
-            # Synchronize all ranks before validation
-            if world_size > 1:
-                dist.barrier()
-            
-            # Only rank 0 evaluates - other ranks skip entirely to avoid dataloader issues
-            if rank == 0 and val_dataloader is not None:
-                print(f"\n  Running validation evaluation...")
-                try:
-                    if model_type == 'ar':
-                        validation_loss = evaluate_ar(model, val_dataloader, device, args, rank, use_hf_data=use_hf_data)
-                    else:
-                        validation_loss = evaluate_mdlm(model, val_dataloader, device, args, rank, use_hf_data=use_hf_data)
-                    
-                    # Check for valid loss value
-                    if validation_loss is None or (isinstance(validation_loss, float) and (validation_loss != validation_loss or validation_loss == float('inf'))):
-                        print(f"  Warning: Invalid validation loss: {validation_loss}, skipping validation")
-                        validation_loss = None
-                    else:
-                        print(f"  Validation Loss: {validation_loss:.4f}")
-                except Exception as e:
-                    print(f"  Error during validation evaluation: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    validation_loss = None
-                # Note: evaluate_* functions already set model.train() in their finally blocks
-            
-            # Broadcast validation loss from rank 0 to all ranks
-            # This MUST happen for all ranks to synchronize
-            if world_size > 1:
-                # Prepare tensor on all ranks
-                if rank == 0:
-                    # Use a sentinel value if validation failed or wasn't run
-                    if validation_loss is None:
-                        validation_loss = float('inf')
-                    validation_loss_tensor = torch.tensor(validation_loss, device=device, dtype=torch.float32)
+        
+        # Run validation evaluation if validation dataloader is available
+        # CRITICAL: Move validation OUTSIDE rank==0 block so ALL ranks participate in barriers
+        validation_loss = None
+        
+        # Synchronize all ranks before validation
+        if world_size > 1:
+            dist.barrier()
+        
+        # Only rank 0 evaluates - other ranks skip entirely to avoid dataloader issues
+        # Limit to 10 batches max to prevent hanging with IterableDataset
+        if rank == 0 and val_dataloader is not None:
+            print(f"\n  Running validation evaluation...")
+            try:
+                # Limit validation batches to prevent IterableDataset hanging
+                max_val_batches = 10
+                if model_type == 'ar':
+                    validation_loss = evaluate_ar(model, val_dataloader, device, args, rank, use_hf_data=use_hf_data, max_batches=max_val_batches)
                 else:
-                    # Other ranks create a placeholder tensor
-                    validation_loss_tensor = torch.tensor(0.0, device=device, dtype=torch.float32)
+                    validation_loss = evaluate_mdlm(model, val_dataloader, device, args, rank, use_hf_data=use_hf_data, max_batches=max_val_batches)
                 
-                # Broadcast from rank 0 to all ranks - ALL ranks must participate
-                dist.broadcast(validation_loss_tensor, src=0)
-                
-                # Extract the value
-                validation_loss = validation_loss_tensor.item()
-                # Convert sentinel value back to None
-                if validation_loss == float('inf'):
+                # Check for valid loss value
+                if validation_loss is None or (isinstance(validation_loss, float) and (validation_loss != validation_loss or validation_loss == float('inf'))):
+                    print(f"  Warning: Invalid validation loss: {validation_loss}, skipping validation")
                     validation_loss = None
+                else:
+                    print(f"  Validation Loss: {validation_loss:.4f}")
+            except Exception as e:
+                print(f"  Error during validation evaluation: {e}")
+                import traceback
+                traceback.print_exc()
+                validation_loss = None
+            # Note: evaluate_* functions already set model.train() in their finally blocks
+        
+        # Broadcast validation loss from rank 0 to all ranks
+        # This MUST happen for all ranks to synchronize
+        if world_size > 1:
+            # Prepare tensor on all ranks
+            if rank == 0:
+                # Use a sentinel value if validation failed or wasn't run
+                if validation_loss is None:
+                    validation_loss = float('inf')
+                validation_loss_tensor = torch.tensor(validation_loss, device=device, dtype=torch.float32)
+            else:
+                # Other ranks create a placeholder tensor
+                validation_loss_tensor = torch.tensor(0.0, device=device, dtype=torch.float32)
             
-            # CRITICAL: Synchronize ALL processes after validation
-            # This barrier MUST be reached by ALL ranks, no exceptions
-            # It's outside all conditionals to ensure every rank participates
-            if world_size > 1:
-                dist.barrier()
+            # Broadcast from rank 0 to all ranks - ALL ranks must participate
+            dist.broadcast(validation_loss_tensor, src=0)
             
-            # Log epoch metrics
+            # Extract the value
+            validation_loss = validation_loss_tensor.item()
+            # Convert sentinel value back to None
+            if validation_loss == float('inf'):
+                validation_loss = None
+        
+        # CRITICAL: Synchronize ALL processes after validation
+        # This barrier MUST be reached by ALL ranks, no exceptions
+        if world_size > 1:
+            dist.barrier()
+        
+        # Log epoch metrics (only on rank 0)
+        if rank == 0:
             if metrics_logger:
                 metrics_logger.log_epoch(epoch, train_loss, step_losses, validation_loss=validation_loss)
             
             # Save checkpoint (with error handling for disk space issues)
             # Only rank 0 saves checkpoints to avoid file conflicts
-            if rank == 0:
-                try:
+            try:
                     checkpoint = {
                         'epoch': epoch,
                         'model_state_dict': model_for_info.state_dict(),
@@ -1115,20 +1141,20 @@ def main_worker(rank, world_size, args):
                                 print(f"  Deleted intermediate checkpoint: {os.path.basename(old_checkpoint)}")
                             except Exception as e:
                                 print(f"  Warning: Could not delete {old_checkpoint}: {e}")
-                except RuntimeError as e:
-                    if "file write failed" in str(e) or "disk" in str(e).lower() or "space" in str(e).lower():
-                        print(f"\n⚠ Warning: Failed to save checkpoint (likely disk space issue): {e}")
-                        print("Training will continue, but checkpoint was not saved.")
-                        print("Consider downloading/moving old checkpoints to free space:")
-                        print("  # Find large checkpoints: du -h ./checkpoints/*.pt | sort -rh")
-                        print("  # Download old ones: scp user@server:~/jen-mdlm-ar/checkpoints/checkpoint_epoch_*.pt ~/Downloads/")
-                        print("  # Then delete from server if needed: rm ./checkpoints/checkpoint_epoch_{1..50}.pt")
-                    else:
-                        print(f"\n⚠ Warning: Failed to save checkpoint: {e}")
-                        print("Training will continue, but checkpoint was not saved.")
-                except Exception as e:
+            except RuntimeError as e:
+                if "file write failed" in str(e) or "disk" in str(e).lower() or "space" in str(e).lower():
+                    print(f"\n⚠ Warning: Failed to save checkpoint (likely disk space issue): {e}")
+                    print("Training will continue, but checkpoint was not saved.")
+                    print("Consider downloading/moving old checkpoints to free space:")
+                    print("  # Find large checkpoints: du -h ./checkpoints/*.pt | sort -rh")
+                    print("  # Download old ones: scp user@server:~/jen-mdlm-ar/checkpoints/checkpoint_epoch_*.pt ~/Downloads/")
+                    print("  # Then delete from server if needed: rm ./checkpoints/checkpoint_epoch_{1..50}.pt")
+                else:
                     print(f"\n⚠ Warning: Failed to save checkpoint: {e}")
                     print("Training will continue, but checkpoint was not saved.")
+            except Exception as e:
+                print(f"\n⚠ Warning: Failed to save checkpoint: {e}")
+                print("Training will continue, but checkpoint was not saved.")
             
             # Synchronize all processes after checkpoint saving before next epoch
             if world_size > 1:
