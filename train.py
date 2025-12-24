@@ -1065,18 +1065,25 @@ def main_worker(rank, world_size, args):
                     validation_loss = None
                 else:
                     print(f"  Validation Loss: {validation_loss:.4f}", flush=True)
+                print(f"  [Rank 0] Validation complete, proceeding to barriers...", flush=True)
             except Exception as e:
                 print(f"  Error during validation: {e}", flush=True)
                 import traceback
                 traceback.print_exc()
                 validation_loss = None
+        else:
+            # Non-rank-0 ranks skip validation
+            if world_size > 1:
+                print(f"  [Rank {rank}] Skipping validation, proceeding to barriers...", flush=True)
         
         # Ensure model is back in train mode on all ranks
         model.train()
         
         # CRITICAL: All ranks must synchronize here after training/validation
         if world_size > 1:
+            print(f"  [Rank {rank}] Reaching barrier after validation...", flush=True)
             dist.barrier()
+            print(f"  [Rank {rank}] Passed barrier after validation.", flush=True)
         
         # Log epoch metrics (only on rank 0)
         if rank == 0:
@@ -1085,7 +1092,9 @@ def main_worker(rank, world_size, args):
         
         # CRITICAL: Final barrier - ALL ranks must reach this before next epoch
         if world_size > 1:
+            print(f"  [Rank {rank}] Reaching final barrier...", flush=True)
             dist.barrier()
+            print(f"  [Rank {rank}] Passed final barrier.", flush=True)
         
         # Debug: Confirm we're continuing to next epoch
         if rank == 0:
