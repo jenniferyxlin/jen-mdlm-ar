@@ -1155,10 +1155,11 @@ def main_worker(rank, world_size, args):
             except Exception as e:
                 print(f"\n⚠ Warning: Failed to save checkpoint: {e}")
                 print("Training will continue, but checkpoint was not saved.")
-            
-            # Synchronize all processes after checkpoint saving before next epoch
-            if world_size > 1:
-                dist.barrier()
+        
+        # CRITICAL: Synchronize ALL processes after checkpoint saving before next epoch
+        # This barrier MUST be outside the rank==0 block so ALL ranks participate
+        if world_size > 1:
+            dist.barrier()
     
     if world_size > 1:
         cleanup_distributed()
