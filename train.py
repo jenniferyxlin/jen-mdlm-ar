@@ -1021,6 +1021,11 @@ def main_worker(rank, world_size, args):
                 improvement_pct = (improvement / prev_loss * 100) if prev_loss > 0 else 0
                 print(f"  Improvement:  {improvement:+.4f} ({improvement_pct:+.2f}%)")
         
+        # CRITICAL: Synchronize all ranks after training, before validation
+        # This ensures all ranks have finished training before rank 0 starts validation
+        if world_size > 1:
+            dist.barrier()
+        
         # Run validation evaluation (only on rank 0)
         # Recreate validation dataloader each epoch to avoid IterableDataset iterator issues
         validation_loss = None
@@ -1076,10 +1081,6 @@ def main_worker(rank, world_size, args):
                 import traceback
                 traceback.print_exc()
                 validation_loss = None
-        else:
-            # Non-rank-0 ranks skip validation
-            if world_size > 1:
-                print(f"  [Rank {rank}] Skipping validation (rank 0 only)...", flush=True)
         
         # Clean up validation dataloader (only on rank 0)
         if rank == 0 and use_hf_data and 'epoch_val_dataloader' in locals():
@@ -1094,81 +1095,17 @@ def main_worker(rank, world_size, args):
         model.train()
         
         # CRITICAL: All ranks must synchronize here IMMEDIATELY after validation
-        # This ensures all ranks have finished their work before checkpoint saving
         if world_size > 1:
-            print(f"  [Rank {rank}] Reaching first barrier (after validation cleanup)...", flush=True)
             dist.barrier()
-            print(f"  [Rank {rank}] Passed first barrier.", flush=True)
         
         # Log epoch metrics (only on rank 0)
         if rank == 0:
             if metrics_logger:
                 metrics_logger.log_epoch(epoch, train_loss, step_losses, validation_loss=validation_loss)
         
-        # Save checkpoint after each epoch (only on rank 0)
-        # NOTE: This happens AFTER the barrier, so all ranks are synchronized
-        # We do this on rank 0 only, then all ranks wait at the next barrier
-        if rank == 0:
-            print(f"  [Rank {rank}] Starting checkpoint save...", flush=True)
-            try:
-                import sys
-                print(f"  Saving checkpoint...", flush=True)
-                sys.stdout.flush()
-                os.makedirs(args.save_dir, exist_ok=True)
-                checkpoint_path = os.path.join(args.save_dir, f'{experiment_name}_checkpoint_epoch_{epoch}.pt')
-                
-                # Get model state dict - for DDP, access module directly to avoid sync issues
-                # Move to CPU immediately to avoid any GPU synchronization during save
-                if isinstance(model, DDP):
-                    # Access the underlying module directly (no DDP sync needed)
-                    raw_state = model.module.state_dict()
-                    # Move to CPU (this is the slow part, but necessary)
-                    model_state = {k: v.cpu() for k, v in raw_state.items()}
-                    del raw_state
-                else:
-                    raw_state = model.state_dict()
-                    model_state = {k: v.cpu() for k, v in raw_state.items()}
-                    del raw_state
-                
-                # Get optimizer state (also move to CPU)
-                opt_state = optimizer.state_dict()
-                
-                checkpoint = {
-                    'epoch': epoch,
-                    'model_state_dict': model_state,
-                    'optimizer_state_dict': opt_state,
-                    'train_loss': train_loss,
-                    'validation_loss': validation_loss,
-                }
-                
-                # Save checkpoint (this is I/O, should be fast)
-                torch.save(checkpoint, checkpoint_path)
-                print(f"  Checkpoint saved: {checkpoint_path}", flush=True)
-                sys.stdout.flush()
-                
-                # Clear checkpoint from memory immediately
-                del checkpoint, model_state, opt_state
-                torch.cuda.empty_cache() if torch.cuda.is_available() else None
-                
-            except Exception as e:
-                print(f"  Warning: Could not save checkpoint: {e}", flush=True)
-                import traceback
-                traceback.print_exc()
-                import sys
-                sys.stdout.flush()
-        else:
-            # Non-rank-0 ranks just pass through
-            if world_size > 1:
-                print(f"  [Rank {rank}] Skipping checkpoint (rank 0 only), proceeding to final barrier...", flush=True)
-        
         # CRITICAL: Final barrier - ALL ranks must reach this before next epoch
-        # This ensures all ranks wait for checkpoint saving to complete
         if world_size > 1:
-            # All ranks print their status before barrier
-            print(f"  [Rank {rank}] Reaching final barrier...", flush=True)
             dist.barrier()
-            # All ranks print their status after barrier
-            print(f"  [Rank {rank}] Passed final barrier.", flush=True)
         
         # Debug: Confirm we're continuing to next epoch
         import sys
