@@ -755,13 +755,17 @@ def main_worker(rank, world_size, args):
             dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
     
     # Create validation dataloader if using HuggingFace dataset
+    # CRITICAL: Only rank 0 loads validation dataset to avoid blocking other ranks
     val_dataloader = None
+    if world_size > 1:
+        # Synchronize all ranks before validation dataset loading
+        dist.barrier()
+    
     if (use_hf_raw or use_hf_data) and rank == 0:
-        # Try to load validation split
+        # Try to load validation split (only on rank 0)
         if use_hf_raw:
             try:
-                if rank == 0:
-                    print("  Loading validation dataset...")
+                print("  Loading validation dataset...", flush=True)
                 val_ds = load_hf_dataset(
                     args.hf_raw_repo,
                     config_name,
@@ -769,17 +773,20 @@ def main_worker(rank, world_size, args):
                     rank,
                     streaming=False  # Don't stream validation
                 )
+                print("  Filtering validation dataset...", flush=True)
                 # Apply same preprocessing as training data
                 filtered_val_ds = val_ds.filter(
                     lambda x: bool(x[args.hf_text_column] and x[args.hf_text_column].strip())
                 )
                 
+                print("  Tokenizing validation dataset...", flush=True)
                 tokenized_val = filtered_val_ds.map(
                     lambda batch: tokenizer(batch[args.hf_text_column], return_attention_mask=False),
                     batched=True,
                     remove_columns=[col for col in filtered_val_ds.column_names if col != "input_ids"]
                 )
                 
+                print("  Chunking validation dataset...", flush=True)
                 processed_val_ds = tokenized_val.map(
                     lambda batch: {
                         "input_ids": [
@@ -800,13 +807,15 @@ def main_worker(rank, world_size, args):
                     val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, sampler=val_sampler, num_workers=0)
                 else:
                     val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
-                if rank == 0:
-                    print(f"  Validation dataset loaded: {len(val_dataset)} samples")
+                print(f"  Validation dataset loaded: {len(val_dataset)} samples", flush=True)
             except Exception as e:
-                if rank == 0:
-                    print(f"  Warning: Could not load validation set: {e}")
+                print(f"  Warning: Could not load validation set: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
+    
         elif use_hf_data:
             try:
+                print("  Creating validation dataloader...", flush=True)
                 val_dataloader = get_dataloader(
                     hf_repo=args.hf_repo,
                     batch_size=args.batch_size,
@@ -821,11 +830,17 @@ def main_worker(rank, world_size, args):
                     replicate_shards=True,  # All ranks see all validation data
                     num_workers=0,  # No workers for validation
                 )
-                if rank == 0:
-                    print("  Validation dataloader created")
+                print("  Validation dataloader created", flush=True)
             except Exception as e:
-                if rank == 0:
-                    print(f"  Warning: Could not create validation dataloader: {e}")
+                print(f"  Warning: Could not create validation dataloader: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
+    
+    # CRITICAL: All ranks must wait for rank 0 to finish loading validation dataset
+    if world_size > 1:
+        dist.barrier()
+        if rank == 0:
+            print("  All ranks synchronized after validation dataset loading.", flush=True)
     
     # CRITICAL: Only create validation dataloader on rank 0 to avoid IterableDataset blocking issues
     # Other ranks don't need it since only rank 0 evaluates validation
