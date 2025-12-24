@@ -827,45 +827,10 @@ def main_worker(rank, world_size, args):
                 if rank == 0:
                     print(f"  Warning: Could not create validation dataloader: {e}")
     
-    # Broadcast val_dataloader availability to all ranks (simplified: just check if it exists on rank 0)
-    has_val = val_dataloader is not None
-    if world_size > 1:
-        has_val_tensor = torch.tensor([1 if has_val else 0], dtype=torch.long, device=device)
-        dist.broadcast(has_val_tensor, src=0)
-        has_val = bool(has_val_tensor.item())
-        # Other ranks need to create their own validation dataloader if rank 0 has one
-        if has_val and rank > 0:
-            if use_hf_raw:
-                try:
-                    val_ds = load_hf_dataset(args.hf_raw_repo, config_name, 'validation', rank, streaming=False)
-                    filtered_val_ds = val_ds.filter(lambda x: bool(x[args.hf_text_column] and x[args.hf_text_column].strip()))
-                    tokenized_val = filtered_val_ds.map(
-                        lambda batch: tokenizer(batch[args.hf_text_column], return_attention_mask=False),
-                        batched=True, remove_columns=[col for col in filtered_val_ds.column_names if col != "input_ids"]
-                    )
-                    processed_val_ds = tokenized_val.map(
-                        lambda batch: {
-                            "input_ids": [
-                                sum(batch["input_ids"], [])[i : i + args.hf_block_size]
-                                for i in range(0, (len(sum(batch["input_ids"], [])) // args.hf_block_size) * args.hf_block_size, args.hf_block_size)
-                            ]
-                        }, batched=True
-                    )
-                    val_dataset = HFRawTextDataset(processed_val_ds, max_length=args.hf_block_size, eod_token=args.eod_token)
-                    val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
-                    val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, sampler=val_sampler, num_workers=0)
-                except:
-                    val_dataloader = None
-            elif use_hf_data:
-                try:
-                    val_dataloader = get_dataloader(
-                        hf_repo=args.hf_repo, batch_size=args.batch_size, seq_len=args.max_seq_len,
-                        rank=rank, world_size=world_size, split='validation', max_tokens=None,
-                        epoch=0, version=args.hf_version, subset=args.hf_subset,
-                        replicate_shards=True, num_workers=0
-                    )
-                except:
-                    val_dataloader = None
+    # CRITICAL: Only create validation dataloader on rank 0 to avoid IterableDataset blocking issues
+    # Other ranks don't need it since only rank 0 evaluates validation
+    if world_size > 1 and rank > 0:
+        val_dataloader = None
     
     # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
@@ -1061,6 +1026,9 @@ def main_worker(rank, world_size, args):
                 print(f"  Error during validation: {e}")
                 validation_loss = None
         
+        # Ensure model is back in train mode on all ranks (validation might have changed it)
+        model.train()
+        
         # CRITICAL: All ranks must synchronize here before checkpoint operations
         if world_size > 1:
             dist.barrier()
@@ -1070,8 +1038,9 @@ def main_worker(rank, world_size, args):
             if metrics_logger:
                 metrics_logger.log_epoch(epoch, train_loss, step_losses, validation_loss=validation_loss)
             
-            # Save checkpoint
+            # Save checkpoint - wrapped in try/except to ensure we always reach barrier
             try:
+                model.train()  # Ensure model is in train mode
                 checkpoint = {
                     'epoch': epoch,
                     'model_state_dict': model_for_info.state_dict(),
@@ -1082,10 +1051,34 @@ def main_worker(rank, world_size, args):
                 checkpoint_path = os.path.join(args.save_dir, f'{experiment_name}_checkpoint_epoch_{epoch+1}.pt')
                 torch.save(checkpoint, checkpoint_path)
                 print(f"\n✓ Checkpoint saved to {checkpoint_path}")
+                
+                # Immediately delete old checkpoints, keeping only the latest
+                try:
+                    checkpoint_pattern = os.path.join(args.save_dir, f'{experiment_name}_checkpoint_epoch_*.pt')
+                    current_run_checkpoints = glob.glob(checkpoint_pattern)
+                    if len(current_run_checkpoints) > 1:
+                        def get_epoch_num(path):
+                            try:
+                                return int(os.path.basename(path).split('_checkpoint_epoch_')[1].replace('.pt', ''))
+                            except:
+                                return 0
+                        current_run_checkpoints.sort(key=get_epoch_num)
+                        # Delete all except the latest (which we just saved)
+                        for old_checkpoint in current_run_checkpoints[:-1]:
+                            try:
+                                os.remove(old_checkpoint)
+                                print(f"  Deleted old checkpoint: {os.path.basename(old_checkpoint)}")
+                            except:
+                                pass
+                except:
+                    pass  # Ignore deletion errors
             except Exception as e:
                 print(f"\n⚠ Warning: Failed to save checkpoint: {e}")
+                import traceback
+                traceback.print_exc()
         
         # CRITICAL: Final barrier - ALL ranks must reach this before next epoch
+        # This MUST be outside rank==0 block - ALL ranks participate
         if world_size > 1:
             dist.barrier()
     
@@ -1096,29 +1089,6 @@ def main_worker(rank, world_size, args):
         print(f"\n{'='*60}")
         print("Training Complete!")
         print(f"{'='*60}")
-        
-        # Clean up old checkpoints, keeping only the latest one
-        try:
-            checkpoint_pattern = os.path.join(args.save_dir, f'{experiment_name}_checkpoint_epoch_*.pt')
-            current_run_checkpoints = glob.glob(checkpoint_pattern)
-            if len(current_run_checkpoints) > 1:
-                def get_epoch_num(path):
-                    try:
-                        return int(os.path.basename(path).split('_checkpoint_epoch_')[1].replace('.pt', ''))
-                    except:
-                        return 0
-                current_run_checkpoints.sort(key=get_epoch_num)
-                checkpoints_to_delete = current_run_checkpoints[:-1]
-                for old_checkpoint in checkpoints_to_delete:
-                    try:
-                        os.remove(old_checkpoint)
-                        print(f"  Deleted intermediate checkpoint: {os.path.basename(old_checkpoint)}")
-                    except Exception as e:
-                        print(f"  Warning: Could not delete {os.path.basename(old_checkpoint)}: {e}")
-                if checkpoints_to_delete:
-                    print(f"✓ Kept latest checkpoint: {os.path.basename(current_run_checkpoints[-1])}")
-        except Exception as e:
-            print(f"  Warning: Could not clean up checkpoints: {e}")
         
         if metrics_logger:
             metrics_file = metrics_logger.save()
