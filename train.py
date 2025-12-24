@@ -1061,6 +1061,10 @@ def main_worker(rank, world_size, args):
                 import traceback
                 traceback.print_exc()
                 validation_loss = None
+        else:
+            # Non-rank-0 ranks skip validation
+            if world_size > 1:
+                print(f"  [Rank {rank}] Skipping validation (rank 0 only)...", flush=True)
         
         # Clean up validation dataloader (only on rank 0)
         if rank == 0 and use_hf_data and 'epoch_val_dataloader' in locals():
@@ -1077,7 +1081,9 @@ def main_worker(rank, world_size, args):
         # CRITICAL: All ranks must synchronize here IMMEDIATELY after validation
         # This ensures all ranks have finished their work before checkpoint saving
         if world_size > 1:
+            print(f"  [Rank {rank}] Reaching first barrier (after validation cleanup)...", flush=True)
             dist.barrier()
+            print(f"  [Rank {rank}] Passed first barrier.", flush=True)
         
         # Log epoch metrics (only on rank 0)
         if rank == 0:
@@ -1088,6 +1094,7 @@ def main_worker(rank, world_size, args):
         # NOTE: This happens AFTER the barrier, so all ranks are synchronized
         # We do this on rank 0 only, then all ranks wait at the next barrier
         if rank == 0:
+            print(f"  [Rank {rank}] Starting checkpoint save...", flush=True)
             try:
                 import sys
                 print(f"  Saving checkpoint...", flush=True)
@@ -1134,6 +1141,10 @@ def main_worker(rank, world_size, args):
                 traceback.print_exc()
                 import sys
                 sys.stdout.flush()
+        else:
+            # Non-rank-0 ranks just pass through
+            if world_size > 1:
+                print(f"  [Rank {rank}] Skipping checkpoint (rank 0 only), proceeding to final barrier...", flush=True)
         
         # CRITICAL: Final barrier - ALL ranks must reach this before next epoch
         # This ensures all ranks wait for checkpoint saving to complete
