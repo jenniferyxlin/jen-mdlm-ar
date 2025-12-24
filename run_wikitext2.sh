@@ -1,6 +1,6 @@
 #!/bin/bash
 # Training script for MDLM and AR models on WikiText-2-v1 dataset
-# Automatically runs all epoch sizes (5, 10, 20, 50, 100, 200, 500) for both models
+# Automatically runs all epoch sizes (5, 10, 20, 50, 100, 200, 500, 1000) for both models
 # Runs sequentially (one after another) using a single port
 
 # Change to the script's directory
@@ -22,7 +22,7 @@ echo "Running from: $(pwd)"
 echo ""
 
 # Epoch sizes to run
-EPOCHS=(5 10 20 50 100 200 500)
+EPOCHS=(5 10 20 50 100 200 500 1000)
 MODEL_TYPES=("mdlm" "ar")
 
 # Base configuration
@@ -62,7 +62,8 @@ run_training() {
     fi
     
     # Check if we can resume from checkpoint
-    local checkpoint_pattern="${SAVE_DIR}/checkpoint_epoch_*.pt"
+    local experiment_name="${model_type}_wikitext2_${epochs}epochs"
+    local checkpoint_pattern="${SAVE_DIR}/${experiment_name}_checkpoint_epoch_*.pt"
     local checkpoints=($(ls $checkpoint_pattern 2>/dev/null | sort -V))
     if [ ${#checkpoints[@]} -gt 0 ]; then
         local latest_checkpoint=${checkpoints[-1]}

@@ -1034,9 +1034,7 @@ def main_worker(rank, world_size, args):
         # CRITICAL: Synchronize all ranks after training, before validation
         # This ensures all ranks have finished training before rank 0 starts validation
         if world_size > 1:
-            print(f"  [Rank {rank}] Reaching barrier before validation...", flush=True)
             dist.barrier()
-            print(f"  [Rank {rank}] Passed barrier before validation.", flush=True)
         
         # Run validation evaluation (only on rank 0)
         # Recreate validation dataloader each epoch to avoid IterableDataset iterator issues
@@ -1077,16 +1075,11 @@ def main_worker(rank, world_size, args):
                     validation_loss = None
                 else:
                     print(f"  Validation Loss: {validation_loss:.4f}", flush=True)
-                print(f"  [Rank 0] Validation complete, proceeding to barriers...", flush=True)
             except Exception as e:
                 print(f"  Error during validation: {e}", flush=True)
                 import traceback
                 traceback.print_exc()
                 validation_loss = None
-        else:
-            # Non-rank-0 ranks skip validation
-            if world_size > 1:
-                print(f"  [Rank {rank}] Skipping validation, proceeding to barriers...", flush=True)
         
         # Ensure model is back in train mode on all ranks
         model.train()
@@ -1099,33 +1092,72 @@ def main_worker(rank, world_size, args):
         # CRITICAL: Final barrier - ALL ranks must reach this before next epoch
         # Use all-reduce as a barrier (more reliable than barrier() in some NCCL setups)
         if world_size > 1:
-            print(f"  [Rank {rank}] Reaching final barrier...", flush=True)
-            import sys
-            sys.stdout.flush()
             try:
                 # Use all-reduce as a synchronization barrier (more reliable)
                 dummy_tensor = torch.tensor([0.0], device=device)
                 dist.all_reduce(dummy_tensor, op=dist.ReduceOp.SUM)
-                # Explicitly flush and verify we passed
-                print(f"  [Rank {rank}] Passed final barrier.", flush=True)
-                sys.stdout.flush()
             except Exception as e:
-                print(f"  [Rank {rank}] ERROR in final barrier: {e}", flush=True)
-                import traceback
-                traceback.print_exc()
                 # Try barrier as fallback
                 try:
                     dist.barrier()
-                    print(f"  [Rank {rank}] Passed final barrier (fallback).", flush=True)
                 except:
-                    print(f"  [Rank {rank}] WARNING: Both barrier methods failed, continuing anyway...", flush=True)
+                    pass
+        
+        # Save checkpoint after each epoch (only on rank 0, after all ranks are synchronized)
+        # Only keep the latest checkpoint - delete old ones after saving new one
+        if rank == 0:
+            try:
+                print(f"  Saving checkpoint...", flush=True)
+                os.makedirs(args.save_dir, exist_ok=True)
+                
+                # Save new checkpoint first (so we don't lose previous if save fails)
+                checkpoint_path = os.path.join(args.save_dir, f'{experiment_name}_checkpoint_epoch_{epoch}.pt')
+                
+                # Get model state dict (move to CPU to save memory)
+                if isinstance(model, DDP):
+                    model_state = model.module.state_dict()
+                else:
+                    model_state = model.state_dict()
+                
+                # Move to CPU to save memory
+                model_state = {k: v.cpu() for k, v in model_state.items()}
+                
+                checkpoint = {
+                    'epoch': epoch,
+                    'model_state_dict': model_state,
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'train_loss': train_loss,
+                    'validation_loss': validation_loss,
+                }
+                
+                # Save checkpoint
+                torch.save(checkpoint, checkpoint_path)
+                print(f"  Checkpoint saved: {checkpoint_path}", flush=True)
+                
+                # Clear from memory
+                del checkpoint, model_state
+                torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                
+                # Delete old checkpoints for this experiment (keep only latest)
+                # Do this AFTER saving to ensure we always have at least one checkpoint
+                checkpoint_pattern = os.path.join(args.save_dir, f'{experiment_name}_checkpoint_epoch_*.pt')
+                old_checkpoints = glob.glob(checkpoint_pattern)
+                for old_checkpoint in old_checkpoints:
+                    # Don't delete the checkpoint we just saved
+                    if old_checkpoint != checkpoint_path:
+                        try:
+                            os.remove(old_checkpoint)
+                        except Exception as e:
+                            print(f"  Warning: Could not delete old checkpoint {old_checkpoint}: {e}", flush=True)
+                
+            except Exception as e:
+                print(f"  Warning: Could not save checkpoint: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
         
         # Debug: Confirm we're continuing to next epoch
         if rank == 0:
             print(f"  Epoch {epoch + 1}/{args.epochs} completed. Starting next epoch...\n", flush=True)
-        elif world_size > 1:
-            # Non-rank-0 ranks also confirm they're continuing
-            print(f"  [Rank {rank}] Continuing to next epoch...", flush=True)
     
     if world_size > 1:
         cleanup_distributed()
