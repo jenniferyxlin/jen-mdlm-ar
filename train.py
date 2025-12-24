@@ -378,9 +378,6 @@ def evaluate_mdlm(model, dataloader, device, args, rank=0, use_hf_data=False, ma
                     pbar.close()
                 # Ensure iterator is fully consumed/exhausted
                 del iterator
-                # Force cleanup
-                import gc
-                gc.collect()
     finally:
         # Ensure model is back in train mode
         model.train()
@@ -444,9 +441,6 @@ def evaluate_ar(model, dataloader, device, args, rank=0, use_hf_data=False, max_
                     pbar.close()
                 # Ensure iterator is fully consumed/exhausted
                 del iterator
-                # Force cleanup
-                import gc
-                gc.collect()
     finally:
         # Ensure model is back in train mode
         model.train()
@@ -1045,23 +1039,30 @@ def main_worker(rank, world_size, args):
                     print(f"  Validation Loss: {validation_loss:.4f}")
             except Exception as e:
                 print(f"  Error during validation: {e}")
+                import traceback
+                traceback.print_exc()
                 validation_loss = None
         elif rank == 0 and val_dataloader is not None:
-            print(f"\n  Running validation evaluation...")
-            max_val_batches = 10
-            if model_type == 'ar':
-                validation_loss = evaluate_ar(model, val_dataloader, device, args, rank, use_hf_data=use_hf_data, max_batches=max_val_batches)
-            else:
-                validation_loss = evaluate_mdlm(model, val_dataloader, device, args, rank, use_hf_data=use_hf_data, max_batches=max_val_batches)
-            
-            if validation_loss is None or (isinstance(validation_loss, float) and (validation_loss != validation_loss or validation_loss == float('inf'))):
-                print(f"  Warning: Invalid validation loss: {validation_loss}")
+            try:
+                print(f"\n  Running validation evaluation...")
+                max_val_batches = 10
+                if model_type == 'ar':
+                    validation_loss = evaluate_ar(model, val_dataloader, device, args, rank, use_hf_data=use_hf_data, max_batches=max_val_batches)
+                else:
+                    validation_loss = evaluate_mdlm(model, val_dataloader, device, args, rank, use_hf_data=use_hf_data, max_batches=max_val_batches)
+                
+                if validation_loss is None or (isinstance(validation_loss, float) and (validation_loss != validation_loss or validation_loss == float('inf'))):
+                    print(f"  Warning: Invalid validation loss: {validation_loss}")
+                    validation_loss = None
+                else:
+                    print(f"  Validation Loss: {validation_loss:.4f}")
+            except Exception as e:
+                print(f"  Error during validation: {e}")
+                import traceback
+                traceback.print_exc()
                 validation_loss = None
-            else:
-                print(f"  Validation Loss: {validation_loss:.4f}")
         
         # CRITICAL: All ranks must synchronize here IMMEDIATELY after validation
-        # Validation only runs on rank 0, other ranks wait here
         if world_size > 1:
             dist.barrier()
         
@@ -1081,10 +1082,31 @@ def main_worker(rank, world_size, args):
         if rank == 0:
             if metrics_logger:
                 metrics_logger.log_epoch(epoch, train_loss, step_losses, validation_loss=validation_loss)
+            
+            # Save checkpoint after each epoch
+            try:
+                os.makedirs(args.save_dir, exist_ok=True)
+                checkpoint_path = os.path.join(args.save_dir, f'{experiment_name}_checkpoint_epoch_{epoch}.pt')
+                checkpoint = {
+                    'epoch': epoch,
+                    'model_state_dict': model.module.state_dict() if isinstance(model, DDP) else model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'train_loss': train_loss,
+                    'validation_loss': validation_loss,
+                }
+                torch.save(checkpoint, checkpoint_path)
+                print(f"  Checkpoint saved: {checkpoint_path}")
+            except Exception as e:
+                if rank == 0:
+                    print(f"  Warning: Could not save checkpoint: {e}")
         
         # CRITICAL: Final barrier - ALL ranks must reach this before next epoch
         if world_size > 1:
             dist.barrier()
+        
+        # Debug: Confirm we're continuing to next epoch
+        if rank == 0:
+            print(f"  Epoch {epoch + 1} completed, continuing to next epoch...\n")
     
     if world_size > 1:
         cleanup_distributed()
