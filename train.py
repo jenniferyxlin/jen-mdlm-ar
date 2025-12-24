@@ -1006,6 +1006,10 @@ def main_worker(rank, world_size, args):
         elif sampler is not None:
             sampler.set_epoch(epoch)
         
+        # Synchronize all ranks after dataloader is ready, before starting training
+        if world_size > 1:
+            dist.barrier()
+        
         if rank == 0:
             print(f"\n{'='*60}")
             print(f"Epoch {epoch + 1}/{args.epochs}")
@@ -1160,6 +1164,7 @@ def main_worker(rank, world_size, args):
         # This barrier MUST be outside the rank==0 block so ALL ranks participate
         if world_size > 1:
             dist.barrier()
+            # All ranks have synchronized, ready for next epoch
     
     if world_size > 1:
         cleanup_distributed()
